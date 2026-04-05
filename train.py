@@ -78,14 +78,12 @@ def make_dataloaders(feat_dict: dict, scaler: feat.PathScaler) -> tuple:
 
 # ── Spline builder (per batch) ─────────────────────────────────────────────────
 
-def _build_paths(X_asset: torch.Tensor, X_macro: torch.Tensor):
-    """Build torchcde cubic spline paths from raw batch tensors."""
-    t = torch.arange(X_asset.shape[1], dtype=torch.float32)
-    asset_coeffs = torchcde.natural_cubic_coeffs(X_asset, t)
-    macro_coeffs = torchcde.natural_cubic_coeffs(X_macro, t)
-    asset_path   = torchcde.CubicSpline(asset_coeffs, t)
-    macro_path   = torchcde.CubicSpline(macro_coeffs, t)
-    return asset_path, macro_path
+def build_combined_path(X_asset: torch.Tensor, X_macro: torch.Tensor) -> torchcde.CubicSpline:
+    """Concatenate asset+macro channel-wise then build a single CubicSpline."""
+    X_combined = torch.cat([X_asset, X_macro], dim=-1)
+    t          = torch.arange(X_combined.shape[1], dtype=torch.float32)
+    coeffs     = torchcde.natural_cubic_coeffs(X_combined, t)
+    return torchcde.CubicSpline(coeffs, t)
 
 
 # ── Training loop ──────────────────────────────────────────────────────────────
@@ -95,8 +93,8 @@ def train_epoch(model, loader_, optimizer) -> float:
     total_loss = 0.0
     for X_a, X_m, y_batch in loader_:
         optimizer.zero_grad()
-        asset_path, macro_path = _build_paths(X_a, X_m)
-        mu, sigma = model(asset_path, macro_path)
+        X_path    = build_combined_path(X_a, X_m)
+        mu, sigma = model(X_path)
         loss = gaussian_nll_loss(mu, sigma, y_batch)
         loss.backward()
         nn.utils.clip_grad_norm_(model.parameters(), cfg.GRAD_CLIP)
@@ -113,8 +111,8 @@ def eval_epoch(model, loader_) -> tuple:
 
     with torch.no_grad():
         for X_a, X_m, y_batch in loader_:
-            asset_path, macro_path = _build_paths(X_a, X_m)
-            mu, sigma = model(asset_path, macro_path)
+            X_path    = build_combined_path(X_a, X_m)
+            mu, sigma = model(X_path)
             loss = gaussian_nll_loss(mu, sigma, y_batch)
             total_loss += loss.item()
             all_mu.append(mu.numpy())
