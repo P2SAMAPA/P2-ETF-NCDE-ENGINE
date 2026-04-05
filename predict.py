@@ -61,14 +61,14 @@ def _get_actual_return(pick: str, signal_date: str, master: pd.DataFrame) -> tup
     return None, None
 
 
-def _build_splines(X_asset: np.ndarray, X_macro: np.ndarray):
-    """Build torchcde cubic spline paths from (1, T, F) numpy arrays."""
+def build_combined_path(X_asset: np.ndarray, X_macro: np.ndarray) -> torchcde.CubicSpline:
+    """Concatenate asset+macro channel-wise then build a single CubicSpline."""
     Xa = torch.tensor(X_asset, dtype=torch.float32)
     Xm = torch.tensor(X_macro, dtype=torch.float32)
-    t  = torch.arange(Xa.shape[1], dtype=torch.float32)
-    asset_path = torchcde.CubicSpline(torchcde.natural_cubic_coeffs(Xa, t), t)
-    macro_path = torchcde.CubicSpline(torchcde.natural_cubic_coeffs(Xm, t), t)
-    return asset_path, macro_path
+    X_combined = torch.cat([Xa, Xm], dim=-1)
+    t          = torch.arange(X_combined.shape[1], dtype=torch.float32)
+    coeffs     = torchcde.natural_cubic_coeffs(X_combined, t)
+    return torchcde.CubicSpline(coeffs, t)
 
 
 # ── Model loader ───────────────────────────────────────────────────────────────
@@ -164,10 +164,10 @@ def generate_signal(option: str, master: pd.DataFrame) -> dict:
     # Scale
     X_asset_s, X_macro_s = scaler.transform(X_asset, X_macro)
 
-    # Build splines and run inference
-    asset_path, macro_path = _build_splines(X_asset_s, X_macro_s)
+    # Build combined spline and run inference
+    X_path = build_combined_path(X_asset_s, X_macro_s)
     with torch.no_grad():
-        mu, sigma = model(asset_path, macro_path)
+        mu, sigma = model(X_path)
 
     mu_arr    = mu.numpy()[0]      # (n_assets,)
     sigma_arr = sigma.numpy()[0]   # (n_assets,)
