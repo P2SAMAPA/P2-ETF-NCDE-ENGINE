@@ -1,0 +1,12 @@
+huggingface_hub
+pandas
+numpy
+pyarrow
+pandas_market_calendars
+streamlit
+plotly
+scikit-learn
+torch
+torchcde
+torchdiffeq
+scipy
