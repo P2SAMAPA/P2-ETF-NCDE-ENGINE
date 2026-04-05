@@ -84,15 +84,26 @@ class NCDEModel(nn.Module):
         h0  = self.initial_proj(X0)                  # (batch, hidden_dim)
 
         # Solve the CDE
+        # For fixed-step solvers (euler, midpoint): pass explicit time grid via t.
+        # For adaptive solvers (dopri5): rtol/atol control accuracy.
+        T      = cfg.LOOKBACK
+        t_span = torch.linspace(0, T - 1, cfg.ODE_STEPS + 1)
+
+        solver_kwargs = {}
+        if cfg.SOLVER in ("euler", "midpoint", "rk4"):
+            solve_t = t_span
+        else:
+            solve_t      = X_path.interval
+            solver_kwargs = {"rtol": 1e-3, "atol": 1e-5}
+
         h_T = torchcde.cdeint(
             X=X_path,
             func=self.vector_field,
             z0=h0,
-            t=X_path.interval,
+            t=solve_t,
             adjoint=cfg.ADJOINT,
             method=cfg.SOLVER,
-            rtol=1e-3,
-            atol=1e-5,
+            **solver_kwargs,
         )
         # h_T shape: (batch, 2, hidden_dim) — take terminal state
         return h_T[:, -1, :]
