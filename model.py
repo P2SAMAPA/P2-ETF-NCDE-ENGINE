@@ -170,45 +170,20 @@ class NCDEForecaster(nn.Module):
         self.n_assets         = n_assets
         self.hidden_dim       = hidden_dim
 
-    def forward(
-        self,
-        asset_path:  torchcde.CubicSpline,
-        macro_path:  torchcde.CubicSpline,
-    ):
+    def forward(self, X_path: torchcde.CubicSpline):
         """
         Args:
-            asset_path : CubicSpline of shape (batch, time, n_asset_path_dim)
-            macro_path : CubicSpline of shape (batch, time, n_macro_feats)
+            X_path : CubicSpline built from asset + macro concatenated channel-wise,
+                     shape (batch, time, n_asset_path_dim + n_macro_feats).
+                     Build with build_combined_path() in train.py / predict.py.
 
         Returns:
             mu    : (batch, n_assets) — predicted next-day returns
             sigma : (batch, n_assets) — predicted uncertainty
         """
-        # Concatenate asset and macro paths channel-wise at each evaluation point
-        # torchcde supports this via a combined spline built at sequence time
-        # We build a CombinedPath wrapper that evaluates both and concatenates
-        combined = _CombinedPath(asset_path, macro_path)
-        h_T      = self.ncde(combined)
+        h_T       = self.ncde(X_path)
         mu, sigma = self.readout(h_T)
         return mu, sigma
-
-
-class _CombinedPath:
-    """
-    Lightweight wrapper that concatenates two CubicSpline paths channel-wise.
-    Implements the torchcde path interface (evaluate, derivative, interval).
-    """
-
-    def __init__(self, path_a: torchcde.CubicSpline, path_b: torchcde.CubicSpline):
-        self.path_a   = path_a
-        self.path_b   = path_b
-        self.interval = path_a.interval
-
-    def evaluate(self, t):
-        return torch.cat([self.path_a.evaluate(t), self.path_b.evaluate(t)], dim=-1)
-
-    def derivative(self, t):
-        return torch.cat([self.path_a.derivative(t), self.path_b.derivative(t)], dim=-1)
 
 
 # ── Loss function ──────────────────────────────────────────────────────────────
