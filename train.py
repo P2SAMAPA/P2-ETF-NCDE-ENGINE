@@ -1,6 +1,7 @@
 # train.py — NCDE training pipeline
 #
 # Trains Option A (Fixed Income) and Option B (Equity) NCDE models.
+# Each option now uses its own architecture + training config from config.py.
 # Output: models/ncde_option{A|B}_best.pt + meta + scaler
 #
 # Usage:
@@ -29,27 +30,27 @@ from model import NCDEForecaster, gaussian_nll_loss
 os.makedirs(cfg.MODELS_DIR, exist_ok=True)
 os.makedirs(cfg.DATA_DIR,   exist_ok=True)
 
-DEVICE = torch.device("cpu")  # GitHub Actions free tier — CPU only
+DEVICE = torch.device("cpu")
+
 
 # ── Dataset helpers ────────────────────────────────────────────────────────────
 
-def make_dataloaders(feat_dict: dict, scaler: feat.PathScaler) -> tuple:
+def make_dataloaders(feat_dict: dict, scaler: feat.PathScaler, ocfg: dict) -> tuple:
     """
     Chronological 80/10/10 split → DataLoaders.
-    Scaler fitted on train only — no data leakage.
+    Scaler fitted on train only. Uses per-option batch_size.
     """
-    X_a = feat_dict["X_asset"]  # (N, T, n_asset_path_dim)
-    X_m = feat_dict["X_macro"]  # (N, T, n_macro_feats)
-    y   = feat_dict["y"]        # (N, n_assets)
+    X_a = feat_dict["X_asset"]
+    X_m = feat_dict["X_macro"]
+    y   = feat_dict["y"]
 
     N       = len(X_a)
     n_train = int(N * cfg.TRAIN_SPLIT)
     n_val   = int(N * cfg.VAL_SPLIT)
 
-    # Fit scaler on train only
-    X_a_tr, X_m_tr = scaler.fit_transform(X_a[:n_train],               X_m[:n_train])
-    X_a_va, X_m_va = scaler.transform(    X_a[n_train:n_train+n_val],  X_m[n_train:n_train+n_val])
-    X_a_te, X_m_te = scaler.transform(    X_a[n_train+n_val:],         X_m[n_train+n_val:])
+    X_a_tr, X_m_tr = scaler.fit_transform(X_a[:n_train],              X_m[:n_train])
+    X_a_va, X_m_va = scaler.transform(    X_a[n_train:n_train+n_val], X_m[n_train:n_train+n_val])
+    X_a_te, X_m_te = scaler.transform(    X_a[n_train+n_val:],        X_m[n_train+n_val:])
 
     def to_ds(Xa, Xm, y_):
         return TensorDataset(
@@ -58,11 +59,12 @@ def make_dataloaders(feat_dict: dict, scaler: feat.PathScaler) -> tuple:
             torch.tensor(y_, dtype=torch.float32),
         )
 
-    train_dl = DataLoader(to_ds(X_a_tr, X_m_tr, y[:n_train]),               batch_size=cfg.BATCH_SIZE, shuffle=False)
-    val_dl   = DataLoader(to_ds(X_a_va, X_m_va, y[n_train:n_train+n_val]),  batch_size=cfg.BATCH_SIZE, shuffle=False)
-    test_dl  = DataLoader(to_ds(X_a_te, X_m_te, y[n_train+n_val:]),         batch_size=cfg.BATCH_SIZE, shuffle=False)
+    bs = ocfg["batch_size"]
+    train_dl = DataLoader(to_ds(X_a_tr, X_m_tr, y[:n_train]),              batch_size=bs, shuffle=False)
+    val_dl   = DataLoader(to_ds(X_a_va, X_m_va, y[n_train:n_train+n_val]), batch_size=bs, shuffle=False)
+    test_dl  = DataLoader(to_ds(X_a_te, X_m_te, y[n_train+n_val:]),        batch_size=bs, shuffle=False)
 
-    dates = feat_dict["dates"]
+    dates  = feat_dict["dates"]
     splits = {
         "n_train":    n_train,
         "n_val":      n_val,
@@ -75,10 +77,9 @@ def make_dataloaders(feat_dict: dict, scaler: feat.PathScaler) -> tuple:
     return train_dl, val_dl, test_dl, splits
 
 
-# ── Spline builder (per batch) ─────────────────────────────────────────────────
+# ── Spline builder ─────────────────────────────────────────────────────────────
 
 def build_combined_path(X_asset: torch.Tensor, X_macro: torch.Tensor) -> torchcde.CubicSpline:
-    """Concatenate asset+macro channel-wise then build a single CubicSpline."""
     X_combined = torch.cat([X_asset, X_macro], dim=-1)
     t          = torch.arange(X_combined.shape[1], dtype=torch.float32)
     coeffs     = torchcde.natural_cubic_coeffs(X_combined, t)
@@ -87,23 +88,22 @@ def build_combined_path(X_asset: torch.Tensor, X_macro: torch.Tensor) -> torchcd
 
 # ── Training loop ──────────────────────────────────────────────────────────────
 
-def train_epoch(model, loader_, optimizer) -> float:
+def train_epoch(model, loader_, optimizer, grad_clip: float) -> float:
     model.train()
     total_loss = 0.0
     for X_a, X_m, y_batch in loader_:
         optimizer.zero_grad()
-        X_path     = build_combined_path(X_a, X_m)
-        mu, sigma  = model(X_path)
-        loss       = gaussian_nll_loss(mu, sigma, y_batch)
+        X_path    = build_combined_path(X_a, X_m)
+        mu, sigma = model(X_path)
+        loss      = gaussian_nll_loss(mu, sigma, y_batch)
         loss.backward()
-        nn.utils.clip_grad_norm_(model.parameters(), cfg.GRAD_CLIP)
+        nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
         optimizer.step()
         total_loss += loss.item()
     return total_loss / len(loader_)
 
 
 def eval_epoch(model, loader_) -> tuple:
-    """Returns (avg_nll, ic, hit_rate, ann_return, sharpe)."""
     model.eval()
     total_loss = 0.0
     all_mu, all_y = [], []
@@ -117,10 +117,9 @@ def eval_epoch(model, loader_) -> tuple:
             all_mu.append(mu.numpy())
             all_y.append(y_batch.numpy())
 
-    mu_arr = np.concatenate(all_mu, axis=0)  # (N, n_assets)
+    mu_arr = np.concatenate(all_mu, axis=0)
     y_arr  = np.concatenate(all_y,  axis=0)
 
-    # Top-1 pick per day (highest mu) — simple signal quality metrics
     picks     = mu_arr.argmax(axis=1)
     pick_rets = y_arr[np.arange(len(picks)), picks]
 
@@ -128,7 +127,6 @@ def eval_epoch(model, loader_) -> tuple:
     sharpe     = float((pick_rets.mean() / (pick_rets.std() + 1e-8)) * np.sqrt(252))
     hit_rate   = float((pick_rets > 0).mean())
 
-    # Information coefficient — rank correlation between mu and actual returns
     from scipy.stats import spearmanr
     ic_list = []
     for i in range(len(mu_arr)):
@@ -142,94 +140,91 @@ def eval_epoch(model, loader_) -> tuple:
 
 def composite_score(nll: float, ic: float, ann_ret: float, sharpe: float) -> float:
     """
-    Composite validation score for early stopping.
+    Composite score for early stopping. Blends NLL, IC, and Sharpe to avoid
+    firing early on the noisy val_ann_return signal.
 
-    Blending NLL, IC, and Sharpe avoids over-fitting to the noisy
-    val_ann_return signal which fires early stopping prematurely on
-    small val sets (~250 samples). Weights tuned for daily ETF returns:
-      - NLL (negated): primary training signal, keep it honest
-      - IC: rank correlation — regime-stable, less noisy than raw return
-      - Sharpe: risk-adjusted quality, more stable than raw ann_return
+    Weights deliberately favour IC (directional signal quality) because:
+    - NLL can improve by just shrinking sigma (not improving direction)
+    - IC is the most stable indicator of genuine ranking ability
+    - Sharpe is noisier than IC on a 450-sample val set but still useful
     """
-    nll_norm    = -nll          # higher is better
-    ic_norm     = ic * 5.0      # scale IC (~0.0–0.2) to similar magnitude
-    sharpe_norm = sharpe * 0.5  # scale Sharpe (~0.0–1.5) to similar magnitude
-    return 0.4 * nll_norm + 0.35 * ic_norm + 0.25 * sharpe_norm
+    return 0.35 * (-nll) + 0.40 * (ic * 5.0) + 0.25 * (sharpe * 0.5)
 
 
-# ── LR warmup ──────────────────────────────────────────────────────────────────
-
-def get_warmup_factor(epoch: int, warmup_epochs: int = 5) -> float:
-    """Linear warmup over first N epochs to avoid early gradient explosions."""
+def get_warmup_lr(epoch: int, base_lr: float, warmup_epochs: int) -> float:
     if epoch <= warmup_epochs:
-        return epoch / warmup_epochs
-    return 1.0
+        return base_lr * (epoch / warmup_epochs)
+    return base_lr
 
 
 # ── Main training function ─────────────────────────────────────────────────────
 
 def train_option(option: str) -> dict:
-    t0 = time.time()
+    t0    = time.time()
+    ocfg  = cfg.OPTION_CONFIGS[option]
+
     print(f"\n{'='*60}")
     print(f"NCDE Training — Option {'A (Fixed Income)' if option == 'A' else 'B (Equity)'}")
+    print(f"  hidden={ocfg['hidden_dim']} vf_dim={ocfg['vector_field_dim']} "
+          f"layers={ocfg['n_layers']} lookback={ocfg['lookback']} "
+          f"ode_steps={ocfg['ode_steps']}")
     print(f"{'='*60}")
 
-    # Load data
     print("\n[1/5] Loading data...")
     master = loader.load_master()
     data   = loader.get_option_data(option, master)
 
-    # Feature engineering
     print("\n[2/5] Building features...")
-    feat_dict = feat.prepare_features(data, lookback=cfg.LOOKBACK)
+    feat_dict = feat.prepare_features(data, lookback=ocfg["lookback"])
     scaler    = feat.PathScaler()
 
-    # Dataloaders
     print("\n[3/5] Preparing dataloaders...")
-    train_dl, val_dl, test_dl, splits = make_dataloaders(feat_dict, scaler)
+    train_dl, val_dl, test_dl, splits = make_dataloaders(feat_dict, scaler, ocfg)
     print(f"  Train: {splits['n_train']} | Val: {splits['n_val']} | Test: {splits['n_test']}")
     print(f"  Train: {splits['train_start']} -> {splits['train_end']}")
     print(f"  Val  : {splits['train_end']} -> {splits['val_end']}")
     print(f"  Test : {splits['val_end']} -> {splits['test_end']}")
 
-    # Model
     print("\n[4/5] Building model...")
     model = NCDEForecaster(
         n_asset_path_dim = feat_dict["n_asset_path_dim"],
         n_macro_feats    = feat_dict["n_macro_feats"],
         n_assets         = feat_dict["n_assets"],
-        hidden_dim       = cfg.HIDDEN_DIM,
-        n_layers         = cfg.N_LAYERS,
-        readout_dim      = cfg.READOUT_DIM,
-        dropout          = cfg.DROPOUT,
+        hidden_dim       = ocfg["hidden_dim"],
+        vector_field_dim = ocfg["vector_field_dim"],
+        n_layers         = ocfg["n_layers"],
+        readout_dim      = ocfg["readout_dim"],
+        dropout          = ocfg["dropout"],
     ).to(DEVICE)
 
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"  Parameters: {n_params:,}")
-    print(f"  Hidden dim: {cfg.HIDDEN_DIM} | VF dim: {cfg.VECTOR_FIELD_DIM} | "
-          f"Layers: {cfg.N_LAYERS} | ODE steps: {cfg.ODE_STEPS} | Lookback: {cfg.LOOKBACK}")
 
     optimizer = torch.optim.AdamW(
-        model.parameters(), lr=cfg.LEARNING_RATE, weight_decay=cfg.WEIGHT_DECAY
+        model.parameters(),
+        lr=ocfg["learning_rate"],
+        weight_decay=ocfg["weight_decay"],
     )
-    # ReduceLROnPlateau on val NLL (stable signal) with config-driven patience
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
         optimizer, mode="min", factor=0.5,
-        patience=cfg.LR_SCHEDULER_PATIENCE,
-        min_lr=1e-6,
+        patience=ocfg["lr_scheduler_patience"],
+        min_lr=5e-7,
     )
 
-    # Training loop
-    warmup_epochs = 5
-    print(f"\n[5/5] Training ({cfg.MAX_EPOCHS} epochs, patience={cfg.PATIENCE}, "
-          f"warmup={warmup_epochs})...")
+    warmup_epochs = ocfg["warmup_epochs"]
+    max_epochs    = ocfg["max_epochs"]
+    patience_cfg  = ocfg["patience"]
+    grad_clip     = ocfg["grad_clip"]
+    base_lr       = ocfg["learning_rate"]
 
-    best_score          = -float("inf")
-    best_val_loss       = float("inf")
-    best_val_ic         = -float("inf")
-    best_val_ann_ret    = -float("inf")
-    best_val_sharpe     = -float("inf")
-    patience_count      = 0
+    print(f"\n[5/5] Training ({max_epochs} epochs, patience={patience_cfg}, warmup={warmup_epochs})...")
+
+    best_score       = -float("inf")
+    best_val_loss    = float("inf")
+    best_val_ic      = -float("inf")
+    best_val_ann_ret = -float("inf")
+    best_val_sharpe  = -float("inf")
+    patience_count   = 0
 
     history = {
         "train_loss": [], "val_loss": [], "val_ic": [],
@@ -238,17 +233,16 @@ def train_option(option: str) -> dict:
 
     model_path = os.path.join(cfg.MODELS_DIR, f"ncde_option{option}_best.pt")
 
-    for epoch in range(1, cfg.MAX_EPOCHS + 1):
+    for epoch in range(1, max_epochs + 1):
 
-        # LR warmup — scale LR linearly for first N epochs
-        warmup_factor = get_warmup_factor(epoch, warmup_epochs)
+        # LR warmup
+        current_lr = get_warmup_lr(epoch, base_lr, warmup_epochs)
         for pg in optimizer.param_groups:
-            pg["lr"] = cfg.LEARNING_RATE * warmup_factor
+            pg["lr"] = current_lr
 
-        train_loss                            = train_epoch(model, train_dl, optimizer)
+        train_loss                              = train_epoch(model, train_dl, optimizer, grad_clip)
         val_loss, val_ic, val_hr, val_ret, val_sharpe = eval_epoch(model, val_dl)
 
-        # Composite score for early stopping (more stable than raw ann_return)
         score = composite_score(val_loss, val_ic, val_ret, val_sharpe)
 
         history["train_loss"].append(round(train_loss, 6))
@@ -258,7 +252,6 @@ def train_option(option: str) -> dict:
         history["val_sharpe"].append(round(val_sharpe, 4))
         history["composite_score"].append(round(score, 6))
 
-        # Step LR scheduler on val NLL (not composite — keep scheduler honest)
         if epoch > warmup_epochs:
             scheduler.step(val_loss)
 
@@ -275,76 +268,56 @@ def train_option(option: str) -> dict:
             patience_count += 1
 
         if epoch % 10 == 0 or epoch == 1:
-            current_lr = optimizer.param_groups[0]["lr"]
+            actual_lr = optimizer.param_groups[0]["lr"]
             print(
                 f"  Epoch {epoch:3d} | train={train_loss:.4f} | "
                 f"val_loss={val_loss:.4f} | val_ret={val_ret:.4f} | "
                 f"val_ic={val_ic:.3f} | val_sharpe={val_sharpe:.3f} | "
-                f"score={score:.4f} | lr={current_lr:.2e} | "
-                f"{'*BEST*' if improved else f'patience {patience_count}/{cfg.PATIENCE}'}"
+                f"score={score:.4f} | lr={actual_lr:.2e} | "
+                f"{'*BEST*' if improved else f'patience {patience_count}/{patience_cfg}'}"
             )
 
-        if patience_count >= cfg.PATIENCE:
+        if patience_count >= patience_cfg:
             print(f"  Early stopping at epoch {epoch}")
             break
 
-    # Test evaluation
+    # Test set evaluation
     print("\nEvaluating on test set...")
     model.load_state_dict(torch.load(model_path, map_location=DEVICE))
     test_loss, test_ic, test_hr, test_ret, test_sharpe = eval_epoch(model, test_dl)
-
     print(
         f"  Test NLL={test_loss:.4f} | IC={test_ic:.3f} | "
         f"Hit={test_hr:.3f} | Ann Return={test_ret:.4f} | Sharpe={test_sharpe:.3f}"
     )
 
-    # Save scaler
     scaler_path = os.path.join(cfg.MODELS_DIR, f"scaler_option{option}.pkl")
     with open(scaler_path, "wb") as f:
         pickle.dump(scaler, f)
 
-    # Save metadata
     elapsed = round(time.time() - t0, 1)
     summary = {
-        "option":            option,
-        "trained_at":        datetime.utcnow().isoformat(),
-        "elapsed_sec":       elapsed,
-        "n_params":          n_params,
-        "n_assets":          feat_dict["n_assets"],
-        "tickers":           feat_dict["tickers"],
-        "n_asset_path_dim":  feat_dict["n_asset_path_dim"],
-        "n_macro_feats":     feat_dict["n_macro_feats"],
-        "lookback":          cfg.LOOKBACK,
-        "best_val_loss":     round(best_val_loss, 6),
-        "best_val_ic":       round(best_val_ic, 4),
+        "option":              option,
+        "trained_at":          datetime.utcnow().isoformat(),
+        "elapsed_sec":         elapsed,
+        "n_params":            n_params,
+        "n_assets":            feat_dict["n_assets"],
+        "tickers":             feat_dict["tickers"],
+        "n_asset_path_dim":    feat_dict["n_asset_path_dim"],
+        "n_macro_feats":       feat_dict["n_macro_feats"],
+        "lookback":            ocfg["lookback"],
+        "best_val_loss":       round(best_val_loss, 6),
+        "best_val_ic":         round(best_val_ic, 4),
         "best_val_ann_return": round(best_val_ann_ret, 4),
-        "best_val_sharpe":   round(best_val_sharpe, 4),
+        "best_val_sharpe":     round(best_val_sharpe, 4),
         "best_composite_score": round(best_score, 6),
-        "test_loss":         round(test_loss, 6),
-        "test_ic":           round(test_ic, 4),
-        "test_hit_rate":     round(test_hr, 4),
-        "test_ann_return":   round(test_ret, 4),
-        "test_sharpe":       round(test_sharpe, 4),
-        "splits":            splits,
-        "history":           history,
-        "config": {
-            "hidden_dim":          cfg.HIDDEN_DIM,
-            "vector_field_dim":    cfg.VECTOR_FIELD_DIM,
-            "n_layers":            cfg.N_LAYERS,
-            "readout_dim":         cfg.READOUT_DIM,
-            "dropout":             cfg.DROPOUT,
-            "solver":              cfg.SOLVER,
-            "ode_steps":           cfg.ODE_STEPS,
-            "adjoint":             cfg.ADJOINT,
-            "lr":                  cfg.LEARNING_RATE,
-            "batch_size":          cfg.BATCH_SIZE,
-            "max_epochs":          cfg.MAX_EPOCHS,
-            "patience":            cfg.PATIENCE,
-            "lr_scheduler_patience": cfg.LR_SCHEDULER_PATIENCE,
-            "lookback":            cfg.LOOKBACK,
-            "train_split":         cfg.TRAIN_SPLIT,
-            "val_split":           cfg.VAL_SPLIT,
-        },
+        "test_loss":           round(test_loss, 6),
+        "test_ic":             round(test_ic, 4),
+        "test_hit_rate":       round(test_hr, 4),
+        "test_ann_return":     round(test_ret, 4),
+        "test_sharpe":         round(test_sharpe, 4),
+        "splits":              splits,
+        "history":             history,
+        "config":              ocfg,
     }
 
     meta_path = os.path.join(cfg.MODELS_DIR, f"meta_option{option}.json")
@@ -353,19 +326,18 @@ def train_option(option: str) -> dict:
 
     elapsed_min = elapsed / 60
     print(f"\nOption {option} done in {elapsed_min:.1f} min")
-    print(f"  Best val composite : {best_score:.4f}")
-    print(f"  Best val Ann Return: {best_val_ann_ret*100:.2f}%")
-    print(f"  Best val IC        : {best_val_ic:.3f}")
-    print(f"  Test Ann Return    : {test_ret*100:.2f}%")
-    print(f"  Test Sharpe        : {test_sharpe:.3f}")
-    print(f"  Model saved        : {model_path}")
+    print(f"  Best composite : {best_score:.4f}")
+    print(f"  Best val IC    : {best_val_ic:.3f}")
+    print(f"  Test Ann Return: {test_ret*100:.2f}%")
+    print(f"  Test Sharpe    : {test_sharpe:.3f}")
+    print(f"  Test IC        : {test_ic:.3f}")
     return summary
 
 
 # ── Entry point ────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Train NCDE model")
+    parser = argparse.ArgumentParser()
     parser.add_argument(
         "--option", choices=["A", "B", "both"], default="both",
         help="A = Fixed Income, B = Equity, both = train sequentially",
