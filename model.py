@@ -1,19 +1,21 @@
 # model.py — Neural Controlled Differential Equation for ETF return forecasting
 #
-# Changes vs previous version:
-#   - NCDEForecaster now accepts vector_field_dim as a constructor argument
-#     so per-option configs in config.py are fully respected.
-#   - VectorField layer dimension bug fixed (intermediate layers used wrong in_dim).
-#   - LayerNorm inside VectorField to stabilise path dynamics across feature scales.
-#   - ReadoutHead bottleneck removed; depth kept at 3 layers without squeeze.
-#   - initial_proj uses Tanh to keep h0 bounded before ODE integration.
+# CORRECTED VERSION: Fix 5 (enriched h0) now integrated into model architecture
+# instead of monkey-patched in train.py. This ensures train/predict compatibility.
+#
+# Changes:
+# - Added enriched_h0 parameter to NCDEModel and NCDEForecaster
+# - initial_proj now uses Linear layer (not Sequential) when enriched_h0=True
+# - Forward method handles both X(t0) only and X(t0)+X(T) concatenation
+# - VectorField layer dimension bug fixed (intermediate layers used wrong in_dim)
+# - LayerNorm inside VectorField to stabilise path dynamics
+# - ReadoutHead bottleneck removed; depth kept at 3 layers
 
 import torch
 import torch.nn as nn
 import torchcde
 
 import config as cfg
-
 
 # ── Vector field ───────────────────────────────────────────────────────────────
 
@@ -28,22 +30,22 @@ class VectorField(nn.Module):
 
     def __init__(
         self,
-        input_dim:       int,
-        hidden_dim:      int,
+        input_dim: int,
+        hidden_dim: int,
         vector_field_dim: int,
-        n_layers:        int,
-        dropout:         float,
+        n_layers: int,
+        dropout: float,
     ):
         super().__init__()
-        self.input_dim  = input_dim
+        self.input_dim = input_dim
         self.hidden_dim = hidden_dim
 
         out_dim = hidden_dim * input_dim
-        layers  = []
-        in_dim  = hidden_dim
+        layers = []
+        in_dim = hidden_dim
 
         for i in range(n_layers):
-            is_last   = (i == n_layers - 1)
+            is_last = (i == n_layers - 1)
             layer_out = out_dim if is_last else vector_field_dim
             layers.append(nn.Linear(in_dim, layer_out))
             if not is_last:
@@ -58,66 +60,83 @@ class VectorField(nn.Module):
         out = self.net(h)
         return out.view(h.shape[0], self.hidden_dim, self.input_dim)
 
-
 # ── NCDE model ─────────────────────────────────────────────────────────────────
 
 class NCDEModel(nn.Module):
     """
     Runs dh = f(h, X(t)) dX(t), h(t0) = h0.
     Returns h(T) — terminal hidden state.
+
+    CORRECTED: Now supports enriched_h0 (Fix 5) as a proper parameter.
+    When enriched_h0=True, h0 is computed from concat([X(t0), X(T)]).
     """
 
     def __init__(
         self,
-        input_dim:        int,
-        hidden_dim:       int,
+        input_dim: int,
+        hidden_dim: int,
         vector_field_dim: int,
-        n_layers:         int,
-        dropout:          float,
-        solver:           str,
-        adjoint:          bool,
-        ode_steps:        int,
-        lookback:         int,
+        n_layers: int,
+        dropout: float,
+        solver: str,
+        adjoint: bool,
+        ode_steps: int,
+        lookback: int,
+        enriched_h0: bool = False,  # ← NEW: Proper parameter for Fix 5
     ):
         super().__init__()
         self.hidden_dim = hidden_dim
-        self.solver     = solver
-        self.adjoint    = adjoint
-        self.ode_steps  = ode_steps
-        self.lookback   = lookback
+        self.solver = solver
+        self.adjoint = adjoint
+        self.ode_steps = ode_steps
+        self.lookback = lookback
+        self.enriched_h0 = enriched_h0  # ← Store the flag
 
         self.vector_field = VectorField(
             input_dim, hidden_dim, vector_field_dim, n_layers, dropout
         )
-        self.initial_proj = nn.Sequential(
-            nn.Linear(input_dim, hidden_dim),
-            nn.Tanh(),
-        )
+
+        # CORRECTED: Always use Linear layer, input size depends on enriched_h0
+        proj_input_dim = input_dim * 2 if enriched_h0 else input_dim
+        self.initial_proj = nn.Linear(proj_input_dim, hidden_dim)
+        # No Tanh here - apply it in forward if needed, or let the network learn
 
     def forward(self, X_path: torchcde.CubicSpline) -> torch.Tensor:
-        X0 = X_path.evaluate(X_path.interval[0])
-        h0 = self.initial_proj(X0)
+        t0 = X_path.interval[0]
+        X0 = X_path.evaluate(t0)  # (batch, input_dim)
+
+        # CORRECTED: Handle enriched h0 (Fix 5) properly
+        if self.enriched_h0:
+            tT = X_path.interval[1]
+            XT = X_path.evaluate(tT)  # (batch, input_dim)
+            # Concatenate X(t0) and X(T) for richer initial state
+            h0 = self.initial_proj(torch.cat([X0, XT], dim=-1))
+        else:
+            # Original behavior: h0 from X(t0) only
+            h0 = self.initial_proj(X0)
+
+        # Apply Tanh to keep h0 bounded before ODE integration
+        h0 = torch.tanh(h0)
 
         t_span = torch.linspace(0, self.lookback - 1, self.ode_steps + 1)
 
         if self.solver in ("euler", "midpoint", "rk4"):
-            solve_t       = t_span
+            solve_t = t_span
             solver_kwargs = {}
         else:
-            solve_t       = X_path.interval
+            solve_t = X_path.interval
             solver_kwargs = {"rtol": 1e-3, "atol": 1e-5}
 
         h_T = torchcde.cdeint(
-            X       = X_path,
-            func    = self.vector_field,
-            z0      = h0,
-            t       = solve_t,
+            X = X_path,
+            func = self.vector_field,
+            z0 = h0,
+            t = solve_t,
             adjoint = self.adjoint,
-            method  = self.solver,
+            method = self.solver,
             **solver_kwargs,
         )
         return h_T[:, -1, :]
-
 
 # ── Readout head ───────────────────────────────────────────────────────────────
 
@@ -131,9 +150,9 @@ class ReadoutHead(nn.Module):
 
     def __init__(self, hidden_dim: int, readout_dim: int, n_assets: int, dropout: float):
         super().__init__()
-        self.norm     = nn.LayerNorm(hidden_dim)
-        self.net      = nn.Sequential(
-            nn.Linear(hidden_dim,  readout_dim),
+        self.norm = nn.LayerNorm(hidden_dim)
+        self.net = nn.Sequential(
+            nn.Linear(hidden_dim, readout_dim),
             nn.SiLU(),
             nn.Dropout(dropout),
             nn.Linear(readout_dim, readout_dim),
@@ -144,13 +163,12 @@ class ReadoutHead(nn.Module):
         self.n_assets = n_assets
 
     def forward(self, h: torch.Tensor):
-        h         = self.norm(h)
-        out       = self.net(h)
-        mu        = out[:, :self.n_assets]
+        h = self.norm(h)
+        out = self.net(h)
+        mu = out[:, :self.n_assets]
         log_sigma = out[:, self.n_assets:]
-        sigma     = torch.exp(log_sigma.clamp(-6, 2))
+        sigma = torch.exp(log_sigma.clamp(-6, 2))
         return mu, sigma
-
 
 # ── Full forecaster ────────────────────────────────────────────────────────────
 
@@ -158,54 +176,58 @@ class NCDEForecaster(nn.Module):
     """
     End-to-end NCDE forecaster. All architecture hyperparameters are passed
     explicitly so per-option configs from config.py are fully respected.
+
+    CORRECTED: Now properly supports enriched_h0 parameter.
     """
 
     def __init__(
         self,
         n_asset_path_dim: int,
-        n_macro_feats:    int,
-        n_assets:         int,
-        hidden_dim:       int   = None,
-        vector_field_dim: int   = None,
-        n_layers:         int   = None,
-        readout_dim:      int   = None,
-        dropout:          float = None,
-        solver:           str   = None,
-        adjoint:          bool  = None,
-        ode_steps:        int   = None,
-        lookback:         int   = None,
+        n_macro_feats: int,
+        n_assets: int,
+        hidden_dim: int = None,
+        vector_field_dim: int = None,
+        n_layers: int = None,
+        readout_dim: int = None,
+        dropout: float = None,
+        solver: str = None,
+        adjoint: bool = None,
+        ode_steps: int = None,
+        lookback: int = None,
+        enriched_h0: bool = False,  # ← NEW: Proper parameter for Fix 5
     ):
         super().__init__()
 
         # Fall back to flat cfg defaults (Option B values) if not provided
-        hidden_dim       = hidden_dim       or cfg.HIDDEN_DIM
+        hidden_dim = hidden_dim or cfg.HIDDEN_DIM
         vector_field_dim = vector_field_dim or cfg.VECTOR_FIELD_DIM
-        n_layers         = n_layers         or cfg.N_LAYERS
-        readout_dim      = readout_dim      or cfg.READOUT_DIM
-        dropout          = dropout          or cfg.DROPOUT
-        solver           = solver           or cfg.SOLVER
-        adjoint          = adjoint          if adjoint is not None else cfg.ADJOINT
-        ode_steps        = ode_steps        or cfg.ODE_STEPS
-        lookback         = lookback         or cfg.LOOKBACK
+        n_layers = n_layers or cfg.N_LAYERS
+        readout_dim = readout_dim or cfg.READOUT_DIM
+        dropout = dropout or cfg.DROPOUT
+        solver = solver or cfg.SOLVER
+        adjoint = adjoint if adjoint is not None else cfg.ADJOINT
+        ode_steps = ode_steps or cfg.ODE_STEPS
+        lookback = lookback or cfg.LOOKBACK
 
         input_dim = n_asset_path_dim + n_macro_feats
 
         self.ncde = NCDEModel(
             input_dim, hidden_dim, vector_field_dim,
             n_layers, dropout, solver, adjoint, ode_steps, lookback,
+            enriched_h0=enriched_h0,  # ← Pass through
         )
         self.readout = ReadoutHead(hidden_dim, readout_dim, n_assets, dropout)
 
         self.n_asset_path_dim = n_asset_path_dim
-        self.n_macro_feats    = n_macro_feats
-        self.n_assets         = n_assets
-        self.hidden_dim       = hidden_dim
+        self.n_macro_feats = n_macro_feats
+        self.n_assets = n_assets
+        self.hidden_dim = hidden_dim
+        self.enriched_h0 = enriched_h0  # ← Store for reference
 
     def forward(self, X_path: torchcde.CubicSpline):
-        h_T       = self.ncde(X_path)
+        h_T = self.ncde(X_path)
         mu, sigma = self.readout(h_T)
         return mu, sigma
-
 
 # ── Loss ───────────────────────────────────────────────────────────────────────
 
