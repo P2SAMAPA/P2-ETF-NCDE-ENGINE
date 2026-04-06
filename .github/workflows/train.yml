@@ -11,10 +11,13 @@ on:
         options: [A, B, both]
 
 jobs:
-  train:
-    runs-on: ubuntu-latest
-    timeout-minutes: 120
 
+  # ── Option A — Fixed Income / Alts ──────────────────────────────────────────
+  # ~45-60 min: compact model (600k params), lookback=90, 130 epochs max
+  train_A:
+    if: ${{ github.event.inputs.option == 'A' || github.event.inputs.option == 'both' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 90        # 45-60 min expected + buffer; well within limit
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -32,14 +35,14 @@ jobs:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
         run: python validate_dataset.py
 
-      - name: Train NCDE models
+      - name: Train Option A (Fixed Income)
         env:
           HF_TOKEN:        ${{ secrets.HF_TOKEN }}
           HF_SOURCE_REPO:  P2SAMAPA/p2-etf-deepm-data
           HF_SIGNALS_REPO: P2SAMAPA/p2-etf-ncde-engine-signals
-        run: python train.py --option ${{ github.event.inputs.option }}
+        run: python train.py --option A
 
-      - name: Upload models to HF
+      - name: Upload Option A models to HF
         env:
           HF_TOKEN:        ${{ secrets.HF_TOKEN }}
           HF_SIGNALS_REPO: P2SAMAPA/p2-etf-ncde-engine-signals
@@ -47,23 +50,92 @@ jobs:
           python - <<'EOF'
           import os, glob
           from huggingface_hub import HfApi
-          api = HfApi(token=os.environ["HF_TOKEN"])
+          api  = HfApi(token=os.environ["HF_TOKEN"])
           repo = os.environ["HF_SIGNALS_REPO"]
-          for f in glob.glob("models/*.pt") + glob.glob("models/*.pkl") + glob.glob("models/meta_*.json"):
+          files = (
+              glob.glob("models/*optionA*.pt")  +
+              glob.glob("models/*optionA*.pkl") +
+              glob.glob("models/meta_optionA*.json")
+          )
+          for f in files:
               fname = os.path.basename(f)
               api.upload_file(
                   path_or_fileobj=f,
                   path_in_repo=f"models/{fname}",
                   repo_id=repo,
                   repo_type="dataset",
-                  commit_message=f"Upload trained model: {fname}",
+                  commit_message=f"Train run: {fname}",
               )
               print(f"Uploaded {fname}")
           EOF
 
-      - name: Generate initial signals
+      - name: Generate Option A signals
         env:
           HF_TOKEN:        ${{ secrets.HF_TOKEN }}
           HF_SOURCE_REPO:  P2SAMAPA/p2-etf-deepm-data
           HF_SIGNALS_REPO: P2SAMAPA/p2-etf-ncde-engine-signals
-        run: python predict.py --option ${{ github.event.inputs.option }}
+        run: python predict.py --option A
+
+  # ── Option B — Equity Sectors ────────────────────────────────────────────────
+  # ~85-100 min: large model (3M params), lookback=60, 150 epochs max
+  train_B:
+    if: ${{ github.event.inputs.option == 'B' || github.event.inputs.option == 'both' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 150       # 85-100 min expected + buffer
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install -r requirements_train.txt
+
+      - name: Validate dataset
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: python validate_dataset.py
+
+      - name: Train Option B (Equity Sectors)
+        env:
+          HF_TOKEN:        ${{ secrets.HF_TOKEN }}
+          HF_SOURCE_REPO:  P2SAMAPA/p2-etf-deepm-data
+          HF_SIGNALS_REPO: P2SAMAPA/p2-etf-ncde-engine-signals
+        run: python train.py --option B
+
+      - name: Upload Option B models to HF
+        env:
+          HF_TOKEN:        ${{ secrets.HF_TOKEN }}
+          HF_SIGNALS_REPO: P2SAMAPA/p2-etf-ncde-engine-signals
+        run: |
+          python - <<'EOF'
+          import os, glob
+          from huggingface_hub import HfApi
+          api  = HfApi(token=os.environ["HF_TOKEN"])
+          repo = os.environ["HF_SIGNALS_REPO"]
+          files = (
+              glob.glob("models/*optionB*.pt")  +
+              glob.glob("models/*optionB*.pkl") +
+              glob.glob("models/meta_optionB*.json")
+          )
+          for f in files:
+              fname = os.path.basename(f)
+              api.upload_file(
+                  path_or_fileobj=f,
+                  path_in_repo=f"models/{fname}",
+                  repo_id=repo,
+                  repo_type="dataset",
+                  commit_message=f"Train run: {fname}",
+              )
+              print(f"Uploaded {fname}")
+          EOF
+
+      - name: Generate Option B signals
+        env:
+          HF_TOKEN:        ${{ secrets.HF_TOKEN }}
+          HF_SOURCE_REPO:  P2SAMAPA/p2-etf-deepm-data
+          HF_SIGNALS_REPO: P2SAMAPA/p2-etf-ncde-engine-signals
+        run: python predict.py --option B
