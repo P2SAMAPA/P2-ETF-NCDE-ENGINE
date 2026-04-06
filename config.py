@@ -72,30 +72,30 @@ TRAIN_END   = "2024-12-31"
 LIVE_START  = "2025-01-01"
 
 # ── Feature engineering ────────────────────────────────────────────────────────
-LOOKBACK        = 30    # trading days — halved from 60; cuts ODE integration time ~50%
+LOOKBACK        = 40    # trading days (~2 months); balanced between speed and path richness
 VOL_WINDOW      = 21    # realised vol window
 ZSCORE_WINDOW   = 63    # rolling z-score window (~1 quarter)
 RETURN_WINDOWS  = [1, 5, 21, 63]
 
 # ── NCDE model architecture ───────────────────────────────────────────────────
-HIDDEN_DIM       = 32   # reduced from 64; vector field MLP runs at every ODE step
-VECTOR_FIELD_DIM = 64   # reduced from 128
+HIDDEN_DIM       = 48   # hidden state dimension
+VECTOR_FIELD_DIM = 96   # intermediate dim inside vector field MLP
 N_LAYERS         = 2    # depth of vector field MLP
 DROPOUT          = 0.1
-SOLVER           = "euler"  # fixed-step; fast on CPU. Options: euler, midpoint, dopri5
-ADJOINT          = False    # direct backprop faster than adjoint on CPU with small models
-ODE_STEPS        = 10       # number of fixed steps for euler/midpoint solver
+SOLVER           = "midpoint"  # 2x evals per step vs euler, much better accuracy
+ADJOINT          = False       # direct backprop faster than adjoint on CPU
+ODE_STEPS        = 20          # integration steps over the lookback window
 
 # ── Readout head ───────────────────────────────────────────────────────────────
 # h(T) → MLP → (mu, log_sigma) per ETF
 # confidence = 1 / sigma (normalised in predict.py)
-READOUT_DIM      = 32   # reduced from 64
+READOUT_DIM      = 48
 
 # ── Training ───────────────────────────────────────────────────────────────────
-BATCH_SIZE    = 64       # larger batch = fewer solver calls per epoch
-MAX_EPOCHS    = 50       # 50 is sufficient; early stopping handles the rest
-PATIENCE      = 8        # early stopping patience
-LEARNING_RATE = 5e-4
+BATCH_SIZE    = 32       # smaller batch = better gradient signal per update
+MAX_EPOCHS    = 80       # sufficient room to converge with early stopping
+PATIENCE      = 15       # patient enough to get past noisy early epochs
+LEARNING_RATE = 3e-4     # slightly slower, more stable
 WEIGHT_DECAY  = 1e-4
 GRAD_CLIP     = 1.0
 
