@@ -1,17 +1,19 @@
 # config.py — Master configuration for P2-ETF-NCDE-ENGINE
 #
-# KEY DESIGN: Option A (Fixed Income) and Option B (Equity) have SEPARATE
-# architecture and training configs. FI ETFs are macro-driven and low-volatility
-# — they need a smaller, more regularised model with a longer lookback.
-# Equity sectors are momentum/sentiment-driven and benefit from a larger model.
+# Neural Controlled Differential Equation engine for next-day ETF return forecasting.
+# Reads source data from P2SAMAPA/p2-etf-deepm-data (maintained by DeePM repo).
+# Writes signals/models to P2SAMAPA/p2-etf-ncde-engine-signals.
 #
-# Evidence from training logs:
-#   Old small model (400k params, lookback=40):  A: IC=0.042, Sharpe=1.84  B: IC=0.004, Sharpe=1.14
-#   New large model (2-3M params, lookback=60):  A: IC=-0.005, Sharpe=1.47 B: IC=0.045, Sharpe=1.48
-#
-# Conclusion: FI needs a compact model + longer lookback. Equity needs the large model.
+# CHANGES vs original:
+#   Fix 2 — Option A gets more epochs (150) and higher patience (25) vs Option B (80/15).
+#            FI universe is lower-signal; it needs more time to converge past noise.
+#   Fix 6 — Option A gets ODE_STEPS=60 (vs 20 default) to halve integration step size
+#            over the 90-day lookback. At 20 steps over 90 days each step = 4.5 days,
+#            which is too coarse for rate-sensitive fixed income path dynamics.
+#            Option B keeps ODE_STEPS=20 — equities converge fine at current resolution.
 
 import os
+from datetime import date
 
 # ── HuggingFace ────────────────────────────────────────────────────────────────
 
@@ -19,7 +21,7 @@ HF_SOURCE_REPO  = os.environ.get("HF_SOURCE_REPO",  "P2SAMAPA/p2-etf-deepm-data"
 HF_SIGNALS_REPO = os.environ.get("HF_SIGNALS_REPO", "P2SAMAPA/p2-etf-ncde-engine-signals")
 HF_TOKEN        = os.environ.get("HF_TOKEN", "")
 
-# ── ETF universes ──────────────────────────────────────────────────────────────
+# ── Option A — Fixed Income / Alternatives ─────────────────────────────────────
 
 FI_ETFS = [
     "TLT",  # 20+ Year Treasury Bond
@@ -32,6 +34,8 @@ FI_ETFS = [
     "MBB",  # Mortgage-Backed Securities
 ]
 FI_BENCHMARK = "AGG"
+
+# ── Option B — Equity Sectors ──────────────────────────────────────────────────
 
 EQ_ETFS = [
     "SPY",  # S&P 500
@@ -49,7 +53,7 @@ EQ_ETFS = [
 ]
 EQ_BENCHMARK = "SPY"
 
-# ── Source dataset file paths ──────────────────────────────────────────────────
+# ── Source dataset file paths (read from HF_SOURCE_REPO) ──────────────────────
 
 FILE_MASTER        = "data/master.parquet"
 FILE_ETF_OHLCV     = "data/etf_ohlcv.parquet"
@@ -57,7 +61,7 @@ FILE_ETF_RETURNS   = "data/etf_returns.parquet"
 FILE_MACRO_FRED    = "data/macro_fred.parquet"
 FILE_MACRO_DERIVED = "data/macro_derived.parquet"
 
-# ── FRED macro columns ─────────────────────────────────────────────────────────
+# ── FRED macro column names (as they appear in master.parquet) ─────────────────
 
 FRED_SERIES = {
     "VIX":       "VIXCLS",
@@ -69,124 +73,69 @@ FRED_SERIES = {
     "USD_INDEX": "DTWEXBGS",
     "WTI_OIL":   "DCOILWTICO",
 }
-
 MACRO_CORE = ["VIX", "T10Y2Y", "HY_SPREAD", "USD_INDEX", "DTB3"]
 
-# ── Train / val / test split ───────────────────────────────────────────────────
+# ── Train / val / test / live split ───────────────────────────────────────────
 
 TRAIN_SPLIT = 0.80
 VAL_SPLIT   = 0.10
-TRAIN_END   = "2024-12-31"
-LIVE_START  = "2025-01-01"
+# test = remaining 0.10
+
+TRAIN_END  = "2024-12-31"
+LIVE_START = "2025-01-01"
 
 # ── Feature engineering ────────────────────────────────────────────────────────
 
-VOL_WINDOW     = 21
-ZSCORE_WINDOW  = 63
-RETURN_WINDOWS = [1, 5, 21, 63]
+LOOKBACK        = 40   # default; overridden per-option in train.py (A=90, B=60)
+VOL_WINDOW      = 21
+ZSCORE_WINDOW   = 63
+RETURN_WINDOWS  = [1, 5, 21, 63]
 
-# ── Per-option configs ─────────────────────────────────────────────────────────
-#
-# Option A — Fixed Income / Alts
-# --------------------------------
-# Bond/commodity returns are dominated by macro (rates, spreads, USD).
-# Returns are smaller in magnitude and more regime-persistent (slow mean reversion).
-# The large model (2.1M params) learned sigma well but lost directional signal
-# entirely (IC=-0.005). The old compact model (400k) kept IC=0.042, Sharpe=1.84.
-# Fix: stay compact, add regularisation, extend lookback to 90 days so the model
-# sees a full Fed cycle phase rather than just 2 months.
-#
-# Option B — Equity Sectors
-# --------------------------
-# Equity returns driven by momentum, risk-on/off, cross-sector rotation.
-# Richer path geometry benefits from more ODE capacity.
-# New large model was a clear improvement: IC=0.045, Sharpe=1.475, Ann=44%.
-# Keep that architecture, minor readout widening for 12-asset output.
+# ── NCDE model architecture ───────────────────────────────────────────────────
 
-OPTION_CONFIGS = {
-    "A": {
-        # Architecture — compact, well-regularised
-        "hidden_dim":             64,   # sweet spot: old 48 was too small, new 96 overfit NLL
-        "vector_field_dim":      128,   # modest upgrade from old 96
-        "n_layers":                2,   # shallow: FI dynamics are lower-frequency
-        "readout_dim":            96,   # fixes old bottleneck (48→24) without over-widening
-        "dropout":              0.20,   # stronger regularisation than equity model
+HIDDEN_DIM       = 48   # hidden state dimension
+VECTOR_FIELD_DIM = 96   # intermediate dim inside vector field MLP
+N_LAYERS         = 2    # depth of vector field MLP
+DROPOUT          = 0.1
+SOLVER           = "midpoint"
+ADJOINT          = False
 
-        # ODE
-        "solver":          "midpoint",
-        "adjoint":              False,
-        "ode_steps":               30,  # 30 steps over 90d path = 1 step per 3 days; fine for FI
+# Fix 6 — ODE_STEPS is now option-specific (set in train.py per option).
+# This default is used only if train.py does not override it.
+# Option A override → 60  (1.5 days/step over 90-day window)
+# Option B override → 20  (3 days/step over 60-day window, sufficient for equity)
+ODE_STEPS = 20
 
-        # Features
-        "lookback":                90,  # 3× old lookback — captures rate cycle phases
+# ── Readout head ───────────────────────────────────────────────────────────────
 
-        # Training
-        "batch_size":              32,
-        "max_epochs":             130,
-        "patience":                25,  # FI val metrics noisy; be patient
-        "learning_rate":         3e-4,
-        "weight_decay":          4e-4,  # stronger L2 — key to keeping IC positive
-        "grad_clip":              0.5,
-        "lr_scheduler_patience":   10,
-        "warmup_epochs":            5,
-    },
+READOUT_DIM = 48
 
-    "B": {
-        # Architecture — larger, proven to work
-        "hidden_dim":             96,
-        "vector_field_dim":      256,
-        "n_layers":                3,
-        "readout_dim":           160,   # slightly wider than previous 128 for 12-asset output
-        "dropout":              0.12,   # equity model wasn't overfitting; ease off dropout
+# ── Training — shared defaults ─────────────────────────────────────────────────
 
-        # ODE
-        "solver":          "midpoint",
-        "adjoint":              False,
-        "ode_steps":               40,
+BATCH_SIZE    = 32
+LEARNING_RATE = 3e-4
+WEIGHT_DECAY  = 1e-4
+GRAD_CLIP     = 1.0
 
-        # Features
-        "lookback":                60,  # equity momentum signals decay fast; 60d is right
+# Fix 2 — Option A gets its own MAX_EPOCHS and PATIENCE (set in train.py).
+# These shared values are used as Option B defaults.
+# Option A: MAX_EPOCHS=150, PATIENCE=25  ← more room to converge on noisy FI signals
+# Option B: MAX_EPOCHS=80,  PATIENCE=15  ← unchanged from original
+MAX_EPOCHS = 80
+PATIENCE   = 15
 
-        # Training
-        "batch_size":              64,
-        "max_epochs":             150,
-        "patience":                22,
-        "learning_rate":         5e-4,
-        "weight_decay":          2e-4,
-        "grad_clip":              0.5,
-        "lr_scheduler_patience":    8,
-        "warmup_epochs":            5,
-    },
-}
+# Per-option overrides (consumed by train.py — do not remove)
+OPTION_A_MAX_EPOCHS = 150
+OPTION_A_PATIENCE   = 25
+OPTION_A_ODE_STEPS  = 60   # Fix 6 — finer integration for 90-day FI lookback
+OPTION_A_LOOKBACK   = 90
 
+OPTION_B_MAX_EPOCHS = 80
+OPTION_B_PATIENCE   = 15
+OPTION_B_ODE_STEPS  = 20
+OPTION_B_LOOKBACK   = 60
 
-def get(option: str, key: str):
-    """Retrieve a per-option config value. e.g. cfg.get('A', 'hidden_dim')"""
-    return OPTION_CONFIGS[option][key]
-
-
-# ── Flat aliases ───────────────────────────────────────────────────────────────
-# Used by Streamlit footnote and any code that reads cfg.SOLVER etc. directly.
-# Always reflects Option B (equity) values as the display default.
-
-HIDDEN_DIM            = OPTION_CONFIGS["B"]["hidden_dim"]
-VECTOR_FIELD_DIM      = OPTION_CONFIGS["B"]["vector_field_dim"]
-N_LAYERS              = OPTION_CONFIGS["B"]["n_layers"]
-READOUT_DIM           = OPTION_CONFIGS["B"]["readout_dim"]
-DROPOUT               = OPTION_CONFIGS["B"]["dropout"]
-SOLVER                = OPTION_CONFIGS["B"]["solver"]
-ADJOINT               = OPTION_CONFIGS["B"]["adjoint"]
-ODE_STEPS             = OPTION_CONFIGS["B"]["ode_steps"]
-LOOKBACK              = OPTION_CONFIGS["B"]["lookback"]
-BATCH_SIZE            = OPTION_CONFIGS["B"]["batch_size"]
-MAX_EPOCHS            = OPTION_CONFIGS["B"]["max_epochs"]
-PATIENCE              = OPTION_CONFIGS["B"]["patience"]
-LEARNING_RATE         = OPTION_CONFIGS["B"]["learning_rate"]
-WEIGHT_DECAY          = OPTION_CONFIGS["B"]["weight_decay"]
-GRAD_CLIP             = OPTION_CONFIGS["B"]["grad_clip"]
-LR_SCHEDULER_PATIENCE = OPTION_CONFIGS["B"]["lr_scheduler_patience"]
-
-# ── Directories ────────────────────────────────────────────────────────────────
+# ── Local runtime directories ──────────────────────────────────────────────────
 
 MODELS_DIR = "models"
 DATA_DIR   = "data"
