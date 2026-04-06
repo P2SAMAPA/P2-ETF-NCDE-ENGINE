@@ -3,7 +3,7 @@
 # Reads latest signals from P2SAMAPA/p2-etf-ncde-engine-signals HF dataset.
 # Tab layout: Option A | Option B
 # Shows: top pick + mu/confidence hero, per-ETF forecast bar chart,
-#        regime context pills, signal history table.
+# regime context pills, signal history table.
 
 import json
 from datetime import datetime
@@ -26,43 +26,24 @@ st.set_page_config(
 
 st.markdown("""
 <style>
-.stApp { background-color: #ffffff; }
-.hero-card {
-    background: #f0f4ff; border: 1px solid #d0d8f0;
-    border-radius: 14px; padding: 28px 32px 22px 32px; margin-bottom: 24px;
-}
-.hero-ticker  { font-size: 64px; font-weight: 700; color: #1a1a2e; line-height: 1.1; }
-.hero-mu      { font-size: 28px; font-weight: 500; color: #3a5bd9; margin-top: 6px; }
-.hero-date    { font-size: 15px; color: #6b7280; margin-top: 8px; }
-.hero-conf    { font-size: 14px; color: #3a5bd9; font-weight: 600;
-                background: #e0e7ff; border-radius: 20px; padding: 3px 12px;
-                display: inline-block; margin-top: 8px; }
-.runner-up    { font-size: 18px; color: #374151; margin-top: 14px;
-                padding-top: 14px; border-top: 1px solid #e5e7eb; }
-.metric-row   { display:flex; gap:12px; margin:10px 0 16px 0; }
-.metric-box   { flex:1; background:#fff; border:1px solid #e5e7eb;
-                border-radius:10px; padding:14px 10px; text-align:center; }
-.metric-label { font-size:12px; color:#6b7280; text-transform:uppercase;
-                letter-spacing:.05em; margin-bottom:6px; }
-.metric-value { font-size:24px; font-weight:600; color:#111827; }
-.pos { color:#059669; } .neg { color:#dc2626; }
-.pill { display:inline-block; padding:5px 14px; border-radius:20px;
-        font-size:15px; font-weight:500; margin:3px 3px 3px 0; }
-.pill-g { background:#d1fae5; color:#065f46; }
-.pill-a { background:#fef3c7; color:#92400e; }
-.pill-r { background:#fee2e2; color:#991b1b; }
-.hit-line { font-size:16px; color:#374151; margin-bottom:10px; }
-.fn { font-size:13px; color:#9ca3af; margin-top:8px; }
-.sec-hdr { font-size:20px; font-weight:700; color:#1a1a2e; margin:28px 0 12px 0; }
+.hero { font-size: 3rem; font-weight: 700; margin-bottom: 0.2rem; }
+.mu { font-size: 1.5rem; font-weight: 600; color: #3a5bd9; }
+.conf { font-size: 1rem; color: #6b7280; }
+.runner { font-size: 0.95rem; color: #374151; margin-top: 0.5rem; }
+.pill-g { color: #059669; font-weight: 500; }
+.pill-r { color: #dc2626; font-weight: 500; }
+.pill-a { color: #6b7280; }
+.metric-box { border: 1px solid #e5e7eb; border-radius: 6px; padding: 0.5rem 0.75rem; margin-right: 0.5rem; display: inline-block; }
+.metric-pos { color: #059669; font-weight: 600; }
+.metric-neg { color: #dc2626; font-weight: 600; }
 </style>
 """, unsafe_allow_html=True)
 
 nyse = mcal.get_calendar("NYSE")
 
-
 # ── Data loading ───────────────────────────────────────────────────────────────
 
-@st.cache_data(ttl=3600)
+@st.cache_data(ttl=300)  # CORRECTED: Reduced cache to 5 minutes
 def load_signals() -> dict:
     try:
         path = hf_hub_download(
@@ -81,7 +62,6 @@ def load_signals() -> dict:
     except Exception as e:
         st.error(f"Could not load signals: {e}")
         return {"A": {}, "B": {}}
-
 
 @st.cache_data(ttl=3600)
 def load_master() -> pd.DataFrame:
@@ -106,7 +86,6 @@ def load_master() -> pd.DataFrame:
         st.error(f"Could not load master dataset: {e}")
         return pd.DataFrame()
 
-
 @st.cache_data(ttl=3600)
 def load_history(option: str) -> pd.DataFrame:
     try:
@@ -122,26 +101,23 @@ def load_history(option: str) -> pd.DataFrame:
     except Exception:
         return pd.DataFrame()
 
-
 def next_trading_day(date: pd.Timestamp) -> pd.Timestamp:
     sched = nyse.schedule(start_date=date, end_date=date + pd.Timedelta(days=10))
-    days  = sched.index[sched.index > date]
+    days = sched.index[sched.index > date]
     return days[0] if len(days) > 0 else date + pd.Timedelta(days=1)
-
 
 # ── UI helpers ─────────────────────────────────────────────────────────────────
 
 def pill(label, val, lo, hi):
     cls = "pill-g" if val < lo else ("pill-r" if val > hi else "pill-a")
-    return f'<span class="pill {cls}">{label}: {val}</span>'
-
+    return f'<span class="{cls}">{label}: {val}</span>'
 
 def render_hero(signal: dict, master: pd.DataFrame):
     if not signal or "top_pick" not in signal:
         st.info("Signal not available yet — run the training workflow first.")
         return
 
-    tickers   = cfg.FI_ETFS if signal.get("option") == "A" else cfg.EQ_ETFS
+    tickers = cfg.FI_ETFS if signal.get("option") == "A" else cfg.EQ_ETFS
     forecasts = signal.get("forecasts", {})
 
     # Sort by mu descending
@@ -166,55 +142,41 @@ def render_hero(signal: dict, master: pd.DataFrame):
 
     runner = ""
     if t2:
-        runner += f"<span style='color:#6b7280'>2nd:</span> <b>{t2[0]}</b> μ={t2[1]:.4f}"
+        runner += f"2nd: **{t2[0]}** μ={t2[1]:.4f}"
     if t3:
-        runner += f"&nbsp;&nbsp;<span style='color:#6b7280'>3rd:</span> <b>{t3[0]}</b> μ={t3[1]:.4f}"
+        runner += f"&nbsp;&nbsp;3rd: **{t3[0]}** μ={t3[1]:.4f}"
 
-    rc   = signal.get("regime_context", {})
-    st_  = signal.get("macro_stress")
+    rc = signal.get("regime_context", {})
+    st_ = signal.get("macro_stress")
     pills = ""
-    if rc.get("VIX"):        pills += pill("VIX",    rc["VIX"],       15,   25)
-    if rc.get("T10Y2Y"):     pills += pill("T10Y2Y", rc["T10Y2Y"],  -0.5,  0.5)
-    if rc.get("HY_SPREAD"):  pills += pill("HY Spr", rc["HY_SPREAD"], 300, 500)
-    if st_ is not None:      pills += pill("Stress",  st_,           -0.5,  0.5)
+    if rc.get("VIX"): pills += pill("VIX", rc["VIX"], 15, 25)
+    if rc.get("T10Y2Y"): pills += pill("T10Y2Y", rc["T10Y2Y"], -0.5, 0.5)
+    if rc.get("HY_SPREAD"): pills += pill("HY Spr", rc["HY_SPREAD"], 300, 500)
+    if st_ is not None: pills += pill("Stress", st_, -0.5, 0.5)
 
     st.markdown(f"""
-<div class="hero-card">
-  <div class="hero-ticker">{t1[0]}</div>
-  <div class="hero-mu">μ = {t1[1]:.4f}</div>
-  <div class="hero-date">Signal for {next_day} &nbsp;·&nbsp; Generated {gen}</div>
-  <div class="hero-conf">Confidence {t1[2]:.1%}</div>
-  <div class="runner-up">{runner}</div>
-  <div style="margin-top:16px">{pills}</div>
-</div>
-""", unsafe_allow_html=True)
-
+    <div class="hero">{t1[0]}</div>
+    <div class="mu">μ = {t1[1]:.4f}</div>
+    <div class="conf">Signal for {next_day} &nbsp;·&nbsp; Generated {gen}</div>
+    <div class="runner">Confidence {t1[2]:.1%}&nbsp;&nbsp;{runner}</div>
+    <div style="margin-top:0.5rem">{pills}</div>
+    """, unsafe_allow_html=True)
 
 def render_model_metrics(signal: dict):
     if not signal:
         return
     fp = lambda v: f"{v*100:.1f}%"
-    c  = lambda v: "pos" if v >= 0 else "neg"
-    r  = signal.get("test_ann_return", 0)
-    s  = signal.get("test_sharpe",     0)
-    ic = signal.get("test_ic",         0)
+    c = lambda v: "pos" if v >= 0 else "neg"
+    r = signal.get("test_ann_return", 0)
+    s = signal.get("test_sharpe", 0)
+    ic = signal.get("test_ic", 0)
     st.markdown(f"""
-<div class="metric-row">
-  <div class="metric-box">
-    <div class="metric-label">Test Ann Return</div>
-    <div class="metric-value {c(r)}">{fp(r)}</div>
-  </div>
-  <div class="metric-box">
-    <div class="metric-label">Test Sharpe</div>
-    <div class="metric-value {c(s)}">{s:.2f}</div>
-  </div>
-  <div class="metric-box">
-    <div class="metric-label">Test IC</div>
-    <div class="metric-value {c(ic)}">{ic:.3f}</div>
-  </div>
-</div>
-""", unsafe_allow_html=True)
-
+    <div style="margin:1rem 0">
+        <span class="metric-box">Ann Return: <span class="{c(r)}">{fp(r)}</span></span>
+        <span class="metric-box">Sharpe: <span class="{c(s)}">{s:.2f}</span></span>
+        <span class="metric-box">IC: <span class="{c(ic)}">{ic:.3f}</span></span>
+    </div>
+    """, unsafe_allow_html=True)
 
 def render_forecast_chart(signal: dict, key: str = ""):
     """Horizontal bar chart of μ per ETF with error bars (±σ)."""
@@ -222,12 +184,12 @@ def render_forecast_chart(signal: dict, key: str = ""):
         return
 
     forecasts = signal["forecasts"]
-    tickers   = cfg.FI_ETFS if signal.get("option") == "A" else cfg.EQ_ETFS
-    tickers   = [t for t in tickers if t in forecasts]
+    tickers = cfg.FI_ETFS if signal.get("option") == "A" else cfg.EQ_ETFS
+    tickers = [t for t in tickers if t in forecasts]
 
-    mus    = [forecasts[t]["mu"]    for t in tickers]
+    mus = [forecasts[t]["mu"] for t in tickers]
     sigmas = [forecasts[t]["sigma"] for t in tickers]
-    confs  = [forecasts[t]["confidence"] for t in tickers]
+    confs = [forecasts[t]["confidence"] for t in tickers]
     colors = ["#3a5bd9" if t == signal["top_pick"] else "#9ca3af" for t in tickers]
 
     fig = go.Figure()
@@ -237,7 +199,7 @@ def render_forecast_chart(signal: dict, key: str = ""):
         marker_color=colors,
         error_x=dict(type="data", array=sigmas, visible=True, color="#d1d5db"),
         customdata=[[c] for c in confs],
-        hovertemplate="<b>%{y}</b><br>μ = %{x:.4f}<br>σ = %{error_x.array:.4f}<br>conf = %{customdata[0]:.1%}<extra></extra>",
+        hovertemplate="<b>%{y}</b><br>μ = %{x:.4f}<br>σ = %{error_x.array:.4f}<br>conf = %{customdata[0]:.1%}",
     ))
     fig.add_vline(x=0, line_width=1, line_dash="dash", line_color="#9ca3af")
     fig.update_layout(
@@ -251,7 +213,6 @@ def render_forecast_chart(signal: dict, key: str = ""):
     st.plotly_chart(fig, use_container_width=True,
                     config={"displayModeBar": False}, key=f"fcst_{key}")
 
-
 def render_history(hist_df: pd.DataFrame, master: pd.DataFrame):
     if hist_df.empty:
         st.info("Signal history will appear after the first prediction run.")
@@ -262,7 +223,7 @@ def render_history(hist_df: pd.DataFrame, master: pd.DataFrame):
         def get_ret(row):
             try:
                 date = pd.Timestamp(row["signal_date"])
-                col  = f"{row['top_pick']}_ret"
+                col = f"{row['top_pick']}_ret"
                 if col in master.columns and date in master.index:
                     return master.loc[date, col]
             except Exception:
@@ -270,7 +231,6 @@ def render_history(hist_df: pd.DataFrame, master: pd.DataFrame):
             return np.nan
         hist_df["actual_return"] = hist_df.apply(get_ret, axis=1)
 
-    # Coerce actual_return to numeric so isnan checks are safe
     if "actual_return" in hist_df.columns:
         hist_df["actual_return"] = pd.to_numeric(hist_df["actual_return"], errors="coerce")
 
@@ -282,12 +242,12 @@ def render_history(hist_df: pd.DataFrame, master: pd.DataFrame):
     disp = hist_df.sort_values("signal_date", ascending=False).copy()
 
     col_map = {
-        "signal_date":    "Date",
-        "top_pick":       "Pick",
-        "top_mu":         "μ",
+        "signal_date": "Date",
+        "top_pick": "Pick",
+        "top_mu": "μ",
         "top_confidence": "Confidence",
-        "actual_return":  "Actual Return",
-        "hit":            "Hit",
+        "actual_return": "Actual Return",
+        "hit": "Hit",
     }
     cols = [c for c in col_map if c in disp.columns]
     disp = disp[cols].rename(columns=col_map)
@@ -296,26 +256,24 @@ def render_history(hist_df: pd.DataFrame, master: pd.DataFrame):
         disp["Confidence"] = disp["Confidence"].apply(lambda x: f"{x*100:.1f}%")
 
     if "Actual Return" in disp.columns:
-        disp["Actual Return"] = pd.to_numeric(disp["Actual Return"], errors="coerce")
         disp["Actual Return"] = disp["Actual Return"].apply(
             lambda x: f"{x*100:.2f}%" if pd.notna(x) else "—"
         )
 
     if "Hit" in disp.columns:
-        hits  = (disp["Hit"] == "✓").sum()
+        hits = (disp["Hit"] == "✓").sum()
         total = disp["Hit"].isin(["✓", "✗"]).sum()
-        hr    = hits / total if total > 0 else 0
+        hr = hits / total if total > 0 else 0
         st.markdown(
-            f"<div class='hit-line'>Hit rate: <b>{hr:.1%}</b> &nbsp;({hits}/{total} signals)</div>",
+            f"<div style='margin-bottom:0.5rem'>Hit rate: <b>{hr:.1%}</b> &nbsp;({hits}/{total} signals)</div>",
             unsafe_allow_html=True,
         )
 
     st.dataframe(disp, use_container_width=True, hide_index=True,
                  column_config={
-                     "Hit":  st.column_config.TextColumn(width="small"),
+                     "Hit": st.column_config.TextColumn(width="small"),
                      "Pick": st.column_config.TextColumn(width="small"),
                  })
-
 
 def render_footnote(signal: dict):
     if not signal:
@@ -327,47 +285,55 @@ def render_footnote(signal: dict):
         pass
     n_params = signal.get("model_n_params", 0)
     st.markdown(
-        f"<div class='fn'>Trained {trained} &nbsp;·&nbsp; "
+        f"<div style='font-size:0.8rem;color:#9ca3af;margin-top:1rem'>"
+        f"Trained {trained} &nbsp;·&nbsp; "
         f"Params: {n_params:,} &nbsp;·&nbsp; "
         f"Solver: {cfg.SOLVER} &nbsp;·&nbsp; "
-        f"Lookback: {cfg.LOOKBACK}d</div>",
+        f"Lookback: {cfg.LOOKBACK}d"
+        f"</div>",
         unsafe_allow_html=True,
     )
-
 
 # ── Option renderer ────────────────────────────────────────────────────────────
 
 def render_option(option: str, signals: dict, master: pd.DataFrame):
-    signal  = signals.get(option, {})
-    hist    = load_history(option)
+    signal = signals.get(option, {})
+    hist = load_history(option)
 
     render_hero(signal, master)
     render_model_metrics(signal)
 
-    st.markdown("<div class='sec-hdr'>ETF Forecasts (μ ± σ)</div>", unsafe_allow_html=True)
+    st.markdown("<hr style='margin:1.5rem 0 0.5rem'>", unsafe_allow_html=True)
+    st.markdown("<b>ETF Forecasts (μ ± σ)</b>", unsafe_allow_html=True)
     st.caption("Bar = predicted next-day return (μ). Error bar = uncertainty (σ). Blue = top pick.")
     render_forecast_chart(signal, key=option)
 
-    st.markdown("<div class='sec-hdr'>Signal History</div>", unsafe_allow_html=True)
+    st.markdown("<hr style='margin:1.5rem 0 0.5rem'>", unsafe_allow_html=True)
+    st.markdown("<b>Signal History</b>", unsafe_allow_html=True)
     render_history(hist, master)
     render_footnote(signal)
-
 
 # ── Main ───────────────────────────────────────────────────────────────────────
 
 def main():
     st.markdown(
-        "<h2 style='margin-bottom:2px;color:#1a1a2e;font-size:34px;'>"
-        "NCDE — Neural CDE ETF Signal Engine</h2>"
-        "<p style='color:#6b7280;font-size:16px;margin-top:0;'>"
+        "<h2 style='margin-bottom:0.2rem'>∂ NCDE — Neural CDE ETF Signal Engine</h2>"
+        "<p style='color:#6b7280;margin-top:0'>"
         "Continuous-time &nbsp;·&nbsp; Controlled Differential Equations "
         "&nbsp;·&nbsp; Macro control path &nbsp;·&nbsp; μ + σ forecasts</p>",
         unsafe_allow_html=True,
     )
 
+    # CORRECTED: Add refresh button
+    col1, col2 = st.columns([6, 1])
+    with col2:
+        if st.button("🔄 Refresh", help="Clear cache and reload signals"):
+            st.cache_data.clear()
+            st.rerun()
+
     with st.spinner("Loading signals and data..."):
         signals = load_signals()
-        master  = load_master()
+        master = load_master()
 
     tab_a, tab_b = st.tabs([
         "📊 Option A — Fixed Income / Alts",
@@ -381,13 +347,11 @@ def main():
         render_option("B", signals, master)
 
     st.markdown(
-        "<div style='margin-top:40px;padding-top:16px;border-top:1px solid #e5e7eb;"
-        "font-size:13px;color:#9ca3af;text-align:center;'>"
+        "<hr style='margin:2rem 0 1rem'><div style='text-align:center;font-size:0.8rem;color:#9ca3af'>"
         "P2-ETF-NCDE-ENGINE &nbsp;·&nbsp; Research only &nbsp;·&nbsp; Not financial advice"
         "</div>",
         unsafe_allow_html=True,
     )
-
 
 if __name__ == "__main__":
     main()
