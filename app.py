@@ -270,9 +270,13 @@ def render_history(hist_df: pd.DataFrame, master: pd.DataFrame):
             return np.nan
         hist_df["actual_return"] = hist_df.apply(get_ret, axis=1)
 
+    # Coerce actual_return to numeric so isnan checks are safe
+    if "actual_return" in hist_df.columns:
+        hist_df["actual_return"] = pd.to_numeric(hist_df["actual_return"], errors="coerce")
+
     if "hit" not in hist_df.columns and "actual_return" in hist_df.columns:
         hist_df["hit"] = hist_df["actual_return"].apply(
-            lambda x: "✓" if (not np.isnan(x) and x > 0) else ("✗" if not np.isnan(x) else "—")
+            lambda x: "✓" if (pd.notna(x) and x > 0) else ("✗" if pd.notna(x) else "—")
         )
 
     disp = hist_df.sort_values("signal_date", ascending=False).copy()
@@ -290,9 +294,11 @@ def render_history(hist_df: pd.DataFrame, master: pd.DataFrame):
 
     if "Confidence" in disp.columns:
         disp["Confidence"] = disp["Confidence"].apply(lambda x: f"{x*100:.1f}%")
+
     if "Actual Return" in disp.columns:
+        disp["Actual Return"] = pd.to_numeric(disp["Actual Return"], errors="coerce")
         disp["Actual Return"] = disp["Actual Return"].apply(
-            lambda x: f"{x*100:.2f}%" if not np.isnan(x) else "—"
+            lambda x: f"{x*100:.2f}%" if pd.notna(x) else "—"
         )
 
     if "Hit" in disp.columns:
