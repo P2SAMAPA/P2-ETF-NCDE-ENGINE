@@ -1,7 +1,12 @@
 # predict.py — Daily signal generation for P2-ETF-NCDE-ENGINE
 #
-# Loads trained NCDE model, runs inference on latest data,
-# and uploads signal JSON + history to HF signals repo.
+# CORRECTED VERSION: Now properly handles enriched_h0 parameter from metadata.
+# This ensures compatibility with models trained with Fix 5 (enriched initial state).
+#
+# Changes:
+# - load_model() now reads enriched_h0 from metadata and passes to model constructor
+# - Removed manual vector_field_dim addition (already in metadata from train.py)
+# - Added proper enriched_h0 handling for state dict compatibility
 #
 # Output schema per option:
 # signal_date, last_data_date, generated_at,
@@ -84,20 +89,42 @@ def load_model(option: str) -> tuple:
     with open(scaler_path, "rb") as f:
         scaler = pickle.load(f)
 
-    # FIX: Added vector_field_dim parameter to match training configuration
+    # CORRECTED: Read enriched_h0 from metadata (Fix 5 flag)
+    # Default to False for backward compatibility with old models
+    enriched_h0 = meta.get("config", {}).get("enriched_h0", False)
+    if enriched_h0 is None:
+        enriched_h0 = meta.get("config", {}).get("fix5_h0_enriched", False)
+
+    # Also support old metadata format
+    if not enriched_h0:
+        enriched_h0 = meta.get("config", {}).get("fix5_h0_enriched", False)
+
+    print(f"[predict] Loading model for Option {option} (enriched_h0={enriched_h0})")
+
+    # CORRECTED: Build model with all parameters from metadata, including enriched_h0
     model = NCDEForecaster(
-        n_asset_path_dim = meta["n_asset_path_dim"],
-        n_macro_feats = meta["n_macro_feats"],
-        n_assets = meta["n_assets"],
-        hidden_dim = meta["config"]["hidden_dim"],
-        vector_field_dim = meta["config"]["vector_field_dim"],  # ← FIXED: Added this line
-        n_layers = meta["config"]["n_layers"],
-        readout_dim = meta["config"]["readout_dim"],
-        dropout = 0.0,  # no dropout at inference
+        n_asset_path_dim=meta["n_asset_path_dim"],
+        n_macro_feats=meta["n_macro_feats"],
+        n_assets=meta["n_assets"],
+        hidden_dim=meta["config"]["hidden_dim"],
+        vector_field_dim=meta["config"]["vector_field_dim"],
+        n_layers=meta["config"]["n_layers"],
+        readout_dim=meta["config"]["readout_dim"],
+        dropout=0.0,  # no dropout at inference
+        solver=meta["config"].get("solver", cfg.SOLVER),
+        adjoint=meta["config"].get("adjoint", cfg.ADJOINT),
+        ode_steps=meta["config"]["ode_steps"],
+        lookback=meta["config"]["lookback"],
+        enriched_h0=enriched_h0,  # ← CORRECTED: Pass enriched_h0 from metadata
     ).to(DEVICE)
 
-    model.load_state_dict(torch.load(model_path, map_location=DEVICE))
+    # Load weights
+    state_dict = torch.load(model_path, map_location=DEVICE)
+    model.load_state_dict(state_dict)
     model.eval()
+
+    print(f"[predict] Model loaded: {sum(p.numel() for p in model.parameters()):,} parameters")
+
     return model, meta, scaler
 
 # ── Inference ──────────────────────────────────────────────────────────────────
@@ -115,7 +142,7 @@ def _build_inference_tensors(option: str, master: pd.DataFrame, meta: dict) -> t
     af = asset_feat.reindex(common_idx).ffill().fillna(0.0)
     mf = macro_feat.reindex(common_idx).ffill().fillna(0.0)
 
-    # Build per-asset column indices (same logic as features.build_sequences)
+    # Build per-asset column indices
     n_assets = len(tickers)
     asset_col_indices = []
     for ticker in tickers:
@@ -193,7 +220,7 @@ def generate_signal(option: str, master: pd.DataFrame) -> dict:
     # Backfill actual return if signal_date already in master
     actual_return, hit = _get_actual_return(top_pick, signal_date, master)
 
-    print(f"  Option {option}: top_pick={top_pick} | mu={top_mu:.4f} | "
+    print(f" Option {option}: top_pick={top_pick} | mu={top_mu:.4f} | "
           f"confidence={top_confidence:.2%} | for {signal_date}")
 
     return {
@@ -342,5 +369,5 @@ if __name__ == "__main__":
 
     for sig, label in [(sig_A, "A"), (sig_B, "B")]:
         if sig:
-            print(f"  Option {label}: {sig['top_pick']} on {sig['signal_date']} "
+            print(f" Option {label}: {sig['top_pick']} on {sig['signal_date']} "
                   f"(mu={sig['top_mu']:.4f}, confidence={sig['top_confidence']:.2%})")
