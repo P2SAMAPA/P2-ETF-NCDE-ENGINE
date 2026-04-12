@@ -43,25 +43,33 @@ nyse = mcal.get_calendar("NYSE")
 
 # ── Data loading ───────────────────────────────────────────────────────────────
 
-@st.cache_data(ttl=300)  # CORRECTED: Reduced cache to 5 minutes
+@st.cache_data(ttl=300)
 def load_signals() -> dict:
-    try:
-        path = hf_hub_download(
-            repo_id=cfg.HF_SIGNALS_REPO,
-            filename="signals/latest_signals.json",
-            repo_type="dataset",
-            token=cfg.HF_TOKEN or None,
-            force_download=True,
-        )
-        with open(path) as f:
-            raw = json.load(f)
-        return {
-            "A": raw.get("option_A") or {},
-            "B": raw.get("option_B") or {},
-        }
-    except Exception as e:
-        st.error(f"Could not load signals: {e}")
-        return {"A": {}, "B": {}}
+    # FIX: Read signal_A.json and signal_B.json directly instead of
+    # latest_signals.json. The combined file is only updated when BOTH options
+    # run together; if they run at different times (or one fails) option_B can
+    # be null/stale inside it while signal_B.json on HF is always current.
+    result = {}
+    for opt in ["A", "B"]:
+        try:
+            path = hf_hub_download(
+                repo_id=cfg.HF_SIGNALS_REPO,
+                filename=f"signals/signal_{opt}.json",
+                repo_type="dataset",
+                token=cfg.HF_TOKEN or None,
+                force_download=True,
+            )
+            with open(path) as f:
+                data = json.load(f)
+            # Guarantee the "option" key is present so render_hero /
+            # render_forecast_chart can select the correct ticker list.
+            if "option" not in data:
+                data["option"] = opt
+            result[opt] = data
+        except Exception as e:
+            st.warning(f"Could not load signal_{opt}.json: {e}")
+            result[opt] = {}
+    return result
 
 @st.cache_data(ttl=3600)
 def load_master() -> pd.DataFrame:
@@ -324,7 +332,6 @@ def main():
         unsafe_allow_html=True,
     )
 
-    # CORRECTED: Add refresh button
     col1, col2 = st.columns([6, 1])
     with col2:
         if st.button("🔄 Refresh", help="Clear cache and reload signals"):
