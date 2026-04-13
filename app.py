@@ -435,29 +435,23 @@ def render_conformal_chart(conf_sig: dict, ncde_sig: dict,
         st.info("Need both NCDE and conformal signals to render comparison chart.")
         return
 
-    # Convert alpha safely
-    try:
-        if isinstance(alpha, str):
-            alpha_val = float(alpha)
-        else:
-            alpha_val = float(alpha)
-        alpha_pct = int(alpha_val * 100)
-        alpha_key = f"{alpha_val:.1f}"
-    except (ValueError, TypeError):
-        alpha_val = 0.9
-        alpha_pct = 90
-        alpha_key = "0.9"
-
+    # Convert alpha to string key (as it appears in JSON)
+    # Your JSON uses "0.9", "0.8", "0.7" as strings
+    alpha_key = str(float(alpha)) if isinstance(alpha, str) else str(alpha)
+    
+    # For display
+    alpha_pct = int(float(alpha) * 100)
+    
     tickers_all = cfg.FI_ETFS if option == "A" else cfg.EQ_ETFS
     ncde_fc  = ncde_sig.get("forecasts", {})
     conf_fc  = conf_sig.get("conformal_forecasts", {})
     
-    # Build data
+    # Build data arrays
     tickers = []
     mus = []
     sigmas = []
-    iv_lo = []
-    iv_hi = []
+    iv_los = []
+    ih_his = []
     
     for t in tickers_all:
         if t not in ncde_fc or t not in conf_fc:
@@ -467,92 +461,94 @@ def render_conformal_chart(conf_sig: dict, ncde_sig: dict,
         mu = ncde_fc[t].get("mu", 0.0)
         sigma = ncde_fc[t].get("sigma", 0.0)
         
-        # Get conformal interval
+        # Get conformal interval for this alpha level
         intervals = conf_fc[t].get("intervals", {})
+        interval = intervals.get(alpha_key, {})
         
-        # Try different key formats
-        interval = None
-        if alpha_key in intervals:
-            interval = intervals[alpha_key]
-        elif str(alpha_val) in intervals:
-            interval = intervals[str(alpha_val)]
-        elif f"{alpha_val:.1f}" in intervals:
-            interval = intervals[f"{alpha_val:.1f}"]
-        
-        if interval:
-            lo = interval.get("lo", mu - sigma)
-            hi = interval.get("hi", mu + sigma)
-        else:
-            lo = mu - sigma
-            hi = mu + sigma
+        lo = interval.get("lo", mu - sigma)
+        hi = interval.get("hi", mu + sigma)
         
         tickers.append(t)
-        mus.append(float(mu))
-        sigmas.append(float(sigma))
-        iv_lo.append(float(lo))
-        iv_hi.append(float(hi))
+        mus.append(mu)
+        sigmas.append(sigma)
+        iv_los.append(lo)
+        ih_his.append(hi)
     
     if not tickers:
-        st.info("No ticker data available for this confidence level.")
+        st.warning(f"No data available for {alpha_pct}% confidence level")
         return
     
     top_pick = conf_sig.get("top_pick", "")
     colors = ["#3a5bd9" if t == top_pick else "#9ca3af" for t in tickers]
     
+    # Create figure
     fig = go.Figure()
     
-    # Conformal intervals trace
+    # Add conformal interval trace (thick colored error bars)
     fig.add_trace(go.Bar(
         name=f"Conformal {alpha_pct}% CI",
         x=mus,
         y=tickers,
-        orientation="h",
-        marker_color=[c + "44" for c in colors],
+        orientation='h',
+        marker_color=[c + '80' for c in colors],  # Add transparency
         error_x=dict(
-            type="data",
+            type='data',
             symmetric=False,
-            array=[hi - mu for hi, mu in zip(iv_hi, mus)],
-            arrayminus=[mu - lo for mu, lo in zip(mus, iv_lo)],
+            array=[ih_his[i] - mus[i] for i in range(len(mus))],
+            arrayminus=[mus[i] - iv_los[i] for i in range(len(mus))],
             visible=True,
-            color="#3a5bd9",
-            thickness=4,
-            width=8,
+            color='#3a5bd9',
+            thickness=6,
+            width=10
         ),
+        showlegend=True
     ))
     
-    # NCDE raw σ trace
+    # Add NCDE raw sigma trace (thin grey error bars)
     fig.add_trace(go.Bar(
         name="NCDE ±σ (raw)",
         x=mus,
         y=tickers,
-        orientation="h",
+        orientation='h',
         marker_color=colors,
         error_x=dict(
-            type="data",
+            type='data',
             array=sigmas,
             visible=True,
-            color="#d1d5db",
-            thickness=1.5,
-            width=4,
+            color='#d1d5db',
+            thickness=2,
+            width=8
         ),
+        showlegend=True
     ))
     
+    # Add vertical line at zero
     fig.add_vline(x=0, line_width=1, line_dash="dash", line_color="#9ca3af")
+    
+    # Update layout
     fig.update_layout(
-        barmode="overlay",
-        height=max(280, len(tickers) * 34),
-        margin=dict(l=0, r=0, t=8, b=0),
-        paper_bgcolor="white",
-        plot_bgcolor="white",
-        xaxis=dict(title="Predicted next-day return",
-                   showgrid=True, gridcolor="#f3f4f6"),
+        barmode='overlay',
+        height=max(300, len(tickers) * 35),
+        margin=dict(l=0, r=0, t=10, b=0),
+        paper_bgcolor='white',
+        plot_bgcolor='white',
+        xaxis=dict(
+            title="Predicted next-day return",
+            showgrid=True,
+            gridcolor='#f3f4f6',
+            tickformat='.3f'
+        ),
         yaxis=dict(showgrid=False),
-        legend=dict(orientation="h", yanchor="bottom", y=1.01,
-                    xanchor="left", x=0),
+        legend=dict(
+            orientation='h',
+            yanchor='bottom',
+            y=1.02,
+            xanchor='left',
+            x=0
+        )
     )
-    st.plotly_chart(fig, use_container_width=True,
-                    config={"displayModeBar": False},
-                    key=f"conf_chart_{option}_{alpha_pct}")
+    
+    st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
 
 
 def render_coverage_diagnostics(conf_sig: dict):
