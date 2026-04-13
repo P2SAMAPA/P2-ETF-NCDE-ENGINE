@@ -1,10 +1,17 @@
 # app.py — P2-ETF-NCDE-ENGINE Streamlit Dashboard
 #
 # Tabs:
-#   📊 Option A — Fixed Income / Alts      (original NCDE, unchanged)
-#   📈 Option B — Equity Sectors           (original NCDE, unchanged)
-#   ∂̂  Conformal — FI / Commodities       (NCDE + conformal intervals)
-#   ∂̂  Conformal — Equities               (NCDE + conformal intervals)
+#   📊 Option A — Fixed Income / Alts       (original NCDE, unchanged)
+#   📈 Option B — Equity Sectors            (original NCDE, unchanged)
+#   ∂̂  Conformal — FI / Commodities         (conformal intervals + diagnostics)
+#   ∂̂  Conformal — Equities                 (conformal intervals + diagnostics)
+#
+# The conformal tabs are deliberately different from the NCDE tabs:
+#   - Signal classification dot-plot (CI positive / negative / straddles zero)
+#   - Side-by-side width comparison chart + q̂ miscalibration chart
+#   - Full q̂ table (no equivalent in NCDE tabs)
+#   - Coverage diagnostics table
+#   - Conformal history with CI covered column
 
 import json
 from datetime import datetime
@@ -12,6 +19,7 @@ from datetime import datetime
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
+from plotly.subplots import make_subplots
 import streamlit as st
 from huggingface_hub import hf_hub_download
 
@@ -35,16 +43,19 @@ st.markdown("""
 .pill-r      { color: #dc2626; font-weight: 500; }
 .pill-a      { color: #6b7280; }
 .metric-box  { border: 1px solid #e5e7eb; border-radius: 6px;
-               padding: 0.5rem 0.75rem; margin-right: 0.5rem; display: inline-block; }
+               padding: 0.5rem 0.75rem; margin-right: 0.5rem;
+               display: inline-block; }
 .metric-pos  { color: #059669; font-weight: 600; }
 .metric-neg  { color: #dc2626; font-weight: 600; }
 .badge-g     { background:#d1fae5; color:#065f46; border-radius:4px;
                padding:2px 8px; font-size:0.82rem; font-weight:600; }
 .badge-r     { background:#fee2e2; color:#991b1b; border-radius:4px;
                padding:2px 8px; font-size:0.82rem; font-weight:600; }
+.badge-y     { background:#fef3c7; color:#92400e; border-radius:4px;
+               padding:2px 8px; font-size:0.82rem; font-weight:600; }
 .badge-a     { background:#f3f4f6; color:#374151; border-radius:4px;
                padding:2px 8px; font-size:0.82rem; }
-.section-hdr { font-weight: 600; font-size: 1rem; margin: 1rem 0 0.3rem; }
+.section-hdr { font-weight:600; font-size:1rem; margin:1rem 0 0.3rem; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -65,10 +76,7 @@ def load_signals() -> dict:
         )
         with open(path) as f:
             raw = json.load(f)
-        return {
-            "A": raw.get("option_A") or {},
-            "B": raw.get("option_B") or {},
-        }
+        return {"A": raw.get("option_A") or {}, "B": raw.get("option_B") or {}}
     except Exception as e:
         st.error(f"Could not load signals: {e}")
         return {"A": {}, "B": {}}
@@ -86,10 +94,7 @@ def load_conformal_signals() -> dict:
         )
         with open(path) as f:
             raw = json.load(f)
-        return {
-            "A": raw.get("option_A") or {},
-            "B": raw.get("option_B") or {},
-        }
+        return {"A": raw.get("option_A") or {}, "B": raw.get("option_B") or {}}
     except Exception:
         return {"A": {}, "B": {}}
 
@@ -152,7 +157,7 @@ def load_conformal_history(option: str) -> pd.DataFrame:
 
 def next_trading_day(date: pd.Timestamp) -> pd.Timestamp:
     sched = nyse.schedule(start_date=date, end_date=date + pd.Timedelta(days=10))
-    days = sched.index[sched.index > date]
+    days  = sched.index[sched.index > date]
     return days[0] if len(days) > 0 else date + pd.Timedelta(days=1)
 
 
@@ -163,14 +168,14 @@ def _fmt_dt(s):
         return s or "—"
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# ORIGINAL NCDE RENDERING (tabs A and B — unchanged)
-# ═══════════════════════════════════════════════════════════════════════════════
-
 def pill(label, val, lo, hi):
     cls = "pill-g" if val < lo else ("pill-r" if val > hi else "pill-a")
     return f'<span class="{cls}">{label}: {val}</span>'
 
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# ORIGINAL NCDE TABS (A and B) — completely unchanged
+# ═══════════════════════════════════════════════════════════════════════════════
 
 def render_hero(signal: dict, master: pd.DataFrame):
     if not signal or "top_pick" not in signal:
@@ -179,13 +184,11 @@ def render_hero(signal: dict, master: pd.DataFrame):
 
     tickers   = cfg.FI_ETFS if signal.get("option") == "A" else cfg.EQ_ETFS
     forecasts = signal.get("forecasts", {})
-
-    ranked = sorted(
+    ranked    = sorted(
         [(t, forecasts[t]["mu"], forecasts[t]["confidence"])
          for t in tickers if t in forecasts],
         key=lambda x: x[1], reverse=True,
     )
-
     t1 = ranked[0] if ranked else (signal["top_pick"], signal["top_mu"],
                                    signal["top_confidence"])
     t2 = ranked[1] if len(ranked) > 1 else None
@@ -196,12 +199,10 @@ def render_hero(signal: dict, master: pd.DataFrame):
     gen = _fmt_dt(signal.get("generated_at", ""))
 
     runner = ""
-    if t2:
-        runner += f"2nd: **{t2[0]}** μ={t2[1]:.4f}"
-    if t3:
-        runner += f"&nbsp;&nbsp;3rd: **{t3[0]}** μ={t3[1]:.4f}"
+    if t2: runner += f"2nd: **{t2[0]}** μ={t2[1]:.4f}"
+    if t3: runner += f"&nbsp;&nbsp;3rd: **{t3[0]}** μ={t3[1]:.4f}"
 
-    rc = signal.get("regime_context", {})
+    rc  = signal.get("regime_context", {})
     st_ = signal.get("macro_stress")
     pills = ""
     if rc.get("VIX"):       pills += pill("VIX",    rc["VIX"],       15, 25)
@@ -238,11 +239,9 @@ def render_model_metrics(signal: dict):
 def render_forecast_chart(signal: dict, key: str = ""):
     if not signal or "forecasts" not in signal:
         return
-
     forecasts = signal["forecasts"]
     tickers   = cfg.FI_ETFS if signal.get("option") == "A" else cfg.EQ_ETFS
     tickers   = [t for t in tickers if t in forecasts]
-
     mus    = [forecasts[t]["mu"]    for t in tickers]
     sigmas = [forecasts[t]["sigma"] for t in tickers]
     confs  = [forecasts[t]["confidence"] for t in tickers]
@@ -254,8 +253,8 @@ def render_forecast_chart(signal: dict, key: str = ""):
         marker_color=colors,
         error_x=dict(type="data", array=sigmas, visible=True, color="#d1d5db"),
         customdata=[[c] for c in confs],
-        hovertemplate="<b>%{y}</b><br>μ = %{x:.4f}<br>σ = %{error_x.array:.4f}"
-                      "<br>conf = %{customdata[0]:.1%}",
+        hovertemplate="<b>%{y}</b><br>μ=%{x:.4f}<br>σ=%{error_x.array:.4f}"
+                      "<br>conf=%{customdata[0]:.1%}",
     ))
     fig.add_vline(x=0, line_width=1, line_dash="dash", line_color="#9ca3af")
     fig.update_layout(
@@ -292,20 +291,20 @@ def render_history(hist_df: pd.DataFrame, master: pd.DataFrame):
         hist_df["actual_return"] = pd.to_numeric(
             hist_df["actual_return"], errors="coerce"
         )
-
     if "hit" not in hist_df.columns and "actual_return" in hist_df.columns:
         hist_df["hit"] = hist_df["actual_return"].apply(
-            lambda x: "✓" if (pd.notna(x) and x > 0) else ("✗" if pd.notna(x) else "—")
+            lambda x: "✓" if (pd.notna(x) and x > 0)
+            else ("✗" if pd.notna(x) else "—")
         )
 
     disp    = hist_df.sort_values("signal_date", ascending=False).copy()
     col_map = {
-        "signal_date":   "Date",
-        "top_pick":      "Pick",
-        "top_mu":        "μ",
-        "top_confidence":"Confidence",
-        "actual_return": "Actual Return",
-        "hit":           "Hit",
+        "signal_date":    "Date",
+        "top_pick":       "Pick",
+        "top_mu":         "μ",
+        "top_confidence": "Confidence",
+        "actual_return":  "Actual Return",
+        "hit":            "Hit",
     }
     cols = [c for c in col_map if c in disp.columns]
     disp = disp[cols].rename(columns=col_map)
@@ -325,7 +324,6 @@ def render_history(hist_df: pd.DataFrame, master: pd.DataFrame):
             f"Hit rate: <b>{hr:.1%}</b> &nbsp;({hits}/{total} signals)</div>",
             unsafe_allow_html=True,
         )
-
     st.dataframe(disp, use_container_width=True, hide_index=True,
                  column_config={
                      "Hit":  st.column_config.TextColumn(width="small"),
@@ -364,52 +362,68 @@ def render_ncde_option(option: str, signals: dict, master: pd.DataFrame):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# CONFORMAL RENDERING (tabs C and D — new)
+# CONFORMAL TABS (C and D) — fundamentally different from NCDE tabs
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def render_conformal_hero(conf_sig: dict, ncde_sig: dict):
-    """Hero card for conformal tab — shows pick + 90% interval badge."""
+def _get_conf_tickers(conf_sig: dict, option: str) -> list:
+    all_t = cfg.FI_ETFS if option == "A" else cfg.EQ_ETFS
+    fc    = conf_sig.get("conformal_forecasts", {})
+    return [t for t in all_t if t in fc and "intervals" in fc[t]]
+
+
+def render_conformal_hero(conf_sig: dict, option: str):
     if not conf_sig or "top_pick" not in conf_sig:
         st.info(
             "Conformal signal not available yet. "
-            "The workflow will auto-calibrate on the next run after training completes."
+            "The daily workflow auto-calibrates on first run after training. "
+            "Check the Actions tab to confirm the conformal workflow ran successfully."
         )
         return
 
-    pick   = conf_sig["top_pick"]
-    mu     = conf_sig["top_mu"]
-    conf_  = conf_sig["top_confidence"]
-    date   = conf_sig.get("signal_date", "—")
-    gen    = _fmt_dt(conf_sig.get("generated_at", ""))
-    n_cal  = conf_sig.get("n_cal", "?")
-    cal_p  = conf_sig.get("cal_period", "?")
-    iv90   = conf_sig.get("top_interval_90", {})
-    lo90   = iv90.get("lo")
-    hi90   = iv90.get("hi")
+    pick  = conf_sig["top_pick"]
+    mu    = conf_sig["top_mu"]
+    conf_ = conf_sig["top_confidence"]
+    date  = conf_sig.get("signal_date", "—")
+    gen   = _fmt_dt(conf_sig.get("generated_at", ""))
+    n_cal = conf_sig.get("n_cal", "?")
+    cal_p = conf_sig.get("cal_period", "?")
+
+    fc   = conf_sig.get("conformal_forecasts", {})
+    iv90 = fc.get(pick, {}).get("intervals", {}).get("0.9", {})
+    lo90 = iv90.get("lo")
+    hi90 = iv90.get("hi")
+    q_90 = fc.get(pick, {}).get("q_hat", {}).get("0.9", "?")
 
     iv_str = (f"[{lo90:.4f}, {hi90:.4f}]"
               if lo90 is not None and hi90 is not None else "—")
 
-    # Macro pills from NCDE signal
-    rc    = conf_sig.get("regime_context", {})
-    st_   = conf_sig.get("macro_stress")
-    pills = ""
-    if rc.get("VIX"):       pills += pill("VIX",    rc["VIX"],       15, 25)
-    if rc.get("T10Y2Y"):    pills += pill("T10Y2Y", rc["T10Y2Y"], -0.5, 0.5)
-    if rc.get("HY_SPREAD"): pills += pill("HY Spr", rc["HY_SPREAD"], 300, 500)
-    if st_ is not None:     pills += pill("Stress",  st_,          -0.5, 0.5)
+    if lo90 is not None and hi90 is not None:
+        if lo90 > 0:
+            sig_class = '<span class="badge-g">STRONG — entire 90% CI positive</span>'
+        elif hi90 < 0:
+            sig_class = '<span class="badge-r">AVOID — entire 90% CI negative</span>'
+        else:
+            sig_class = '<span class="badge-y">UNCERTAIN — CI crosses zero</span>'
+    else:
+        sig_class = ""
 
-    # Ranked picks from conformal_forecasts
-    fc = conf_sig.get("conformal_forecasts", {})
+    rc  = conf_sig.get("regime_context", {})
+    st_ = conf_sig.get("macro_stress")
+    pills = ""
+    if rc.get("VIX"):       pills += pill("VIX",    rc["VIX"],       15, 25) + "&nbsp;"
+    if rc.get("T10Y2Y"):    pills += pill("T10Y2Y", rc["T10Y2Y"], -0.5, 0.5) + "&nbsp;"
+    if rc.get("HY_SPREAD"): pills += pill("HY Spr", rc["HY_SPREAD"], 300, 500)
+    if st_ is not None:     pills += "&nbsp;" + pill("Stress", st_,  -0.5, 0.5)
+
     ranked = sorted(
         [(t, d["mu"]) for t, d in fc.items()],
         key=lambda x: x[1], reverse=True,
     )
     runner = ""
-    if len(ranked) > 1:
-        runner += f"2nd: **{ranked[1][0]}** μ={ranked[1][1]:.4f}"
-    if len(ranked) > 2:
-        runner += f"&nbsp;&nbsp;3rd: **{ranked[2][0]}** μ={ranked[2][1]:.4f}"
+    if len(ranked) > 1: runner += f"2nd: **{ranked[1][0]}** μ={ranked[1][1]:.4f}"
+    if len(ranked) > 2: runner += f"&nbsp;&nbsp;3rd: **{ranked[2][0]}** μ={ranked[2][1]:.4f}"
+
+    q_str = f"{q_90:.3f}" if isinstance(q_90, float) else str(q_90)
 
     st.markdown(f"""
 <div class="hero">{pick}</div>
@@ -417,167 +431,228 @@ def render_conformal_hero(conf_sig: dict, ncde_sig: dict):
 <div class="conf">Signal for {date} &nbsp;·&nbsp; Generated {gen}</div>
 <div class="runner">Confidence {conf_:.1%}&nbsp;&nbsp;{runner}</div>
 <div style="margin-top:0.5rem">
-  <span class="badge-g">90% CI {iv_str}</span>
-  &nbsp;
+  {sig_class}&nbsp;
+  <span class="badge-a">90% CI {iv_str}</span>&nbsp;
+  <span class="badge-a">q̂={q_str} × σ</span>
+</div>
+<div style="margin-top:0.4rem">
   <span class="badge-a">cal n={n_cal} &nbsp;·&nbsp; {cal_p}</span>
 </div>
 <div style="margin-top:0.4rem">{pills}</div>
 """, unsafe_allow_html=True)
 
 
-def render_conformal_chart(conf_sig: dict, ncde_sig: dict,
-                           alpha: str, option: str):
+def render_signal_classification_chart(conf_sig: dict, option: str, alpha: str):
     """
-    Overlay chart: NCDE ±σ (thin grey) vs conformal interval (thick coloured).
-    Blue = top pick.
+    Dot-plot: μ as dot, CI as horizontal bar.
+    Color encodes signal quality: green = CI fully positive, red = CI fully negative,
+    grey = straddles zero. Sorted by μ descending.
+    Completely different from the NCDE bar chart.
     """
-    if not conf_sig or not ncde_sig:
-        st.info("Need both NCDE and conformal signals to render comparison chart.")
+    tickers = _get_conf_tickers(conf_sig, option)
+    if not tickers:
+        st.info("No tickers with conformal interval data yet.")
         return
 
-    # Convert alpha to string key (as it appears in JSON)
-    try:
-        alpha_float = float(alpha)
-        alpha_key = str(alpha_float)
-        alpha_pct = int(alpha_float * 100)
-    except:
-        alpha_key = "0.9"
-        alpha_pct = 90
-    
-    tickers_all = cfg.FI_ETFS if option == "A" else cfg.EQ_ETFS
-    ncde_fc  = ncde_sig.get("forecasts", {})
-    conf_fc  = conf_sig.get("conformal_forecasts", {})
-    
-    # Build data arrays
-    tickers = []
-    mus = []
-    sigmas = []
-    iv_los = []
-    iv_his = []
-    
-    for t in tickers_all:
-        if t not in ncde_fc or t not in conf_fc:
-            continue
-            
-        # Get NCDE values
-        mu = ncde_fc[t].get("mu", 0.0)
-        sigma = ncde_fc[t].get("sigma", 0.0)
-        
-        # Get conformal interval for this alpha level
-        intervals = conf_fc[t].get("intervals", {})
-        interval = intervals.get(alpha_key, {})
-        
-        lo = interval.get("lo", mu - sigma)
-        hi = interval.get("hi", mu + sigma)
-        
-        tickers.append(t)
-        mus.append(float(mu))
-        sigmas.append(float(sigma))
-        iv_los.append(float(lo))
-        iv_his.append(float(hi))
-    
-    if not tickers:
-        st.warning(f"No data available for {alpha_pct}% confidence level")
+    conf_fc = conf_sig.get("conformal_forecasts", {})
+    valid   = [t for t in tickers
+               if alpha in conf_fc.get(t, {}).get("intervals", {})]
+    if not valid:
+        st.info(f"No interval data at this coverage level yet.")
         return
-    
-    top_pick = conf_sig.get("top_pick", "")
-    
-    # Create simple colors - no transparency issues
-    bar_colors = []
-    for t in tickers:
-        if t == top_pick:
-            bar_colors.append("#3a5bd9")
+
+    # Sort by μ descending
+    valid = sorted(valid, key=lambda t: conf_fc[t]["mu"], reverse=True)
+
+    mus   = [conf_fc[t]["mu"] for t in valid]
+    iv_lo = [conf_fc[t]["intervals"][alpha]["lo"] for t in valid]
+    iv_hi = [conf_fc[t]["intervals"][alpha]["hi"] for t in valid]
+    top   = conf_sig.get("top_pick", "")
+
+    dot_colors  = []
+    line_colors = []
+    for t, lo, hi in zip(valid, iv_lo, iv_hi):
+        if t == top:
+            dot_colors.append("#3a5bd9")
+            line_colors.append("rgba(58,91,217,0.4)")
+        elif lo > 0:
+            dot_colors.append("#059669")
+            line_colors.append("rgba(5,150,105,0.35)")
+        elif hi < 0:
+            dot_colors.append("#dc2626")
+            line_colors.append("rgba(220,38,38,0.35)")
         else:
-            bar_colors.append("#9ca3af")
-    
-    # Create figure
+            dot_colors.append("#9ca3af")
+            line_colors.append("rgba(156,163,175,0.25)")
+
     fig = go.Figure()
-    
-    # Add conformal interval trace (thick colored error bars)
-    # Calculate error bar values
-    error_plus = []
-    error_minus = []
-    for i in range(len(mus)):
-        error_plus.append(iv_his[i] - mus[i])
-        error_minus.append(mus[i] - iv_los[i])
-    
-    fig.add_trace(go.Bar(
-        name=f"Conformal {alpha_pct}% CI",
-        x=mus,
-        y=tickers,
-        orientation='h',
-        marker_color=bar_colors,
-        opacity=0.3,
-        error_x=dict(
-            type='data',
-            symmetric=False,
-            array=error_plus,
-            arrayminus=error_minus,
-            visible=True,
-            color="#3a5bd9",
-            thickness=6,
-            width=10
+
+    for i, t in enumerate(valid):
+        fig.add_trace(go.Scatter(
+            x=[iv_lo[i], iv_hi[i]], y=[t, t],
+            mode="lines",
+            line=dict(color=line_colors[i], width=7),
+            showlegend=False, hoverinfo="skip",
+        ))
+
+    fig.add_trace(go.Scatter(
+        x=mus, y=valid, mode="markers",
+        marker=dict(color=dot_colors, size=11,
+                    line=dict(width=1.5, color="white")),
+        customdata=list(zip(
+            iv_lo, iv_hi,
+            [conf_fc[t]["q_hat"].get(alpha, "?") for t in valid],
+        )),
+        hovertemplate=(
+            "<b>%{y}</b><br>"
+            "μ = %{x:.4f}<br>"
+            "CI lo = %{customdata[0]:.4f}<br>"
+            "CI hi = %{customdata[1]:.4f}<br>"
+            "q̂ = %{customdata[2]:.3f}"
         ),
-        showlegend=True
+        showlegend=False,
     ))
-    
-    # Add NCDE raw sigma trace (thin grey error bars)
-    fig.add_trace(go.Bar(
-        name="NCDE ±σ (raw)",
-        x=mus,
-        y=tickers,
-        orientation='h',
-        marker_color=bar_colors,
-        opacity=0.8,
-        error_x=dict(
-            type='data',
-            array=sigmas,
-            visible=True,
-            color='#d1d5db',
-            thickness=2,
-            width=8
-        ),
-        showlegend=True
-    ))
-    
-    # Add vertical line at zero
+
     fig.add_vline(x=0, line_width=1, line_dash="dash", line_color="#9ca3af")
-    
-    # Calculate height based on number of tickers
-    chart_height = max(400, len(tickers) * 35)
-    
-    # Update layout
     fig.update_layout(
-        barmode='overlay',
-        height=chart_height,
-        margin=dict(l=10, r=10, t=30, b=30),
-        paper_bgcolor='white',
-        plot_bgcolor='white',
-        xaxis=dict(
-            title="Predicted next-day return",
-            showgrid=True,
-            gridcolor='#f3f4f6',
-            tickformat='.3f',
-            zeroline=False
-        ),
-        yaxis=dict(
-            showgrid=False,
-            title=None
-        ),
-        legend=dict(
-            orientation='h',
-            yanchor='bottom',
-            y=1.02,
-            xanchor='left',
-            x=0
-        )
+        height=max(300, len(valid) * 36),
+        margin=dict(l=0, r=0, t=10, b=0),
+        paper_bgcolor="white", plot_bgcolor="white",
+        xaxis=dict(title="Return  (dot = μ,  bar = conformal CI)",
+                   showgrid=True, gridcolor="#f3f4f6"),
+        yaxis=dict(showgrid=False),
     )
-    
-    st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
+    st.plotly_chart(fig, use_container_width=True,
+                    config={"displayModeBar": False},
+                    key=f"conf_dot_{option}_{alpha}")
+
+
+def render_interval_comparison_chart(conf_sig: dict, ncde_sig: dict,
+                                     alpha: str, option: str):
+    """
+    Two-panel chart:
+    Left:  conformal CI width vs raw NCDE 2σ — shows how much q̂ inflated the interval
+    Right: q̂ per ETF — the NCDE miscalibration factor (red dashed at 1.0)
+    """
+    if not conf_sig or not ncde_sig:
+        return
+
+    tickers = _get_conf_tickers(conf_sig, option)
+    if not tickers:
+        return
+
+    ncde_fc = ncde_sig.get("forecasts", {})
+    conf_fc = conf_sig.get("conformal_forecasts", {})
+    valid   = [t for t in tickers
+               if alpha in conf_fc.get(t, {}).get("intervals", {})
+               and t in ncde_fc]
+    if not valid:
+        return
+
+    ncde_2s   = [2 * ncde_fc[t]["sigma"]                          for t in valid]
+    conf_w    = [conf_fc[t]["intervals"][alpha]["width"]            for t in valid]
+    q_hats    = [conf_fc[t]["q_hat"].get(alpha, 1.0)               for t in valid]
+    top_pick  = conf_sig.get("top_pick", "")
+
+    width_colors = ["#3a5bd9" if t == top_pick else "#6b7280" for t in valid]
+    q_colors     = []
+    for t, q in zip(valid, q_hats):
+        if t == top_pick:
+            q_colors.append("#3a5bd9")
+        elif q > 1.5:
+            q_colors.append("#f59e0b")   # orange = NCDE badly overconfident
+        else:
+            q_colors.append("#9ca3af")
+
+    fig = make_subplots(
+        rows=1, cols=2,
+        subplot_titles=[
+            f"CI width — NCDE 2σ (grey) vs conformal {int(float(alpha)*100)}% (colour)",
+            f"q̂ per ETF  (red line = 1.0, perfectly calibrated)",
+        ],
+        horizontal_spacing=0.14,
+    )
+
+    fig.add_trace(go.Bar(
+        name="NCDE 2σ", x=ncde_2s, y=valid, orientation="h",
+        marker_color="#e5e7eb",
+        hovertemplate="<b>%{y}</b><br>NCDE 2σ = %{x:.5f}",
+    ), row=1, col=1)
+
+    fig.add_trace(go.Bar(
+        name=f"Conformal {int(float(alpha)*100)}% width",
+        x=conf_w, y=valid, orientation="h",
+        marker_color=width_colors, opacity=0.8,
+        hovertemplate="<b>%{y}</b><br>Conformal width = %{x:.5f}",
+    ), row=1, col=1)
+
+    fig.add_trace(go.Bar(
+        name="q̂ (miscalibration factor)",
+        x=q_hats, y=valid, orientation="h",
+        marker_color=q_colors,
+        hovertemplate="<b>%{y}</b><br>q̂ = %{x:.3f}<extra></extra>",
+    ), row=1, col=2)
+
+    fig.add_vline(x=1.0, line_width=1.5, line_dash="dash",
+                  line_color="#ef4444", row=1, col=2)
+
+    fig.update_layout(
+        barmode="overlay",
+        height=max(320, len(valid) * 36),
+        margin=dict(l=0, r=0, t=40, b=0),
+        paper_bgcolor="white", plot_bgcolor="white",
+        showlegend=True,
+        legend=dict(orientation="h", yanchor="bottom", y=1.05,
+                    xanchor="left", x=0),
+        font=dict(size=11),
+    )
+    fig.update_xaxes(showgrid=True, gridcolor="#f3f4f6", row=1, col=1)
+    fig.update_xaxes(showgrid=True, gridcolor="#f3f4f6",
+                     title_text="q̂", row=1, col=2)
+    fig.update_yaxes(showgrid=False)
+
+    st.plotly_chart(fig, use_container_width=True,
+                    config={"displayModeBar": False},
+                    key=f"conf_width_{option}_{alpha}")
+
+
+def render_q_hat_table(conf_sig: dict, option: str):
+    """Full per-ETF table of μ, σ, q̂ at all levels, and CI bounds. No NCDE equivalent."""
+    tickers = _get_conf_tickers(conf_sig, option)
+    if not tickers:
+        return
+
+    conf_fc = conf_sig.get("conformal_forecasts", {})
+    rows = []
+    for t in tickers:
+        fc_t = conf_fc.get(t, {})
+        q    = fc_t.get("q_hat",     {})
+        ivs  = fc_t.get("intervals", {})
+        rows.append({
+            "ETF":            t,
+            "μ":              round(fc_t.get("mu",    0), 5),
+            "σ (NCDE)":       round(fc_t.get("sigma", 0), 5),
+            "q̂ 90%":         round(q.get("0.9", 0),  3),
+            "q̂ 80%":         round(q.get("0.8", 0),  3),
+            "q̂ 70%":         round(q.get("0.7", 0),  3),
+            "CI 90% lo":      round(ivs.get("0.9", {}).get("lo",    0), 5),
+            "CI 90% hi":      round(ivs.get("0.9", {}).get("hi",    0), 5),
+            "CI 90% width":   round(ivs.get("0.9", {}).get("width", 0), 5),
+        })
+
+    if not rows:
+        return
+
+    df = pd.DataFrame(rows).sort_values("μ", ascending=False)
+    st.caption(
+        "q̂ > 1 → NCDE σ was **too tight** on this ETF (intervals inflated). "
+        "q̂ < 1 → NCDE was over-cautious (intervals shrunk slightly). "
+        "🟠 q̂ > 1.5 = significant NCDE overconfidence on this asset."
+    )
+    st.dataframe(df, use_container_width=True, hide_index=True)
 
 
 def render_coverage_diagnostics(conf_sig: dict):
-    """Coverage diagnostics table — calibration-set empirical coverage vs target."""
     diag = (conf_sig or {}).get("coverage_diagnostics") or {}
     if not diag:
         return
@@ -585,8 +660,8 @@ def render_coverage_diagnostics(conf_sig: dict):
     st.markdown('<div class="section-hdr">Calibration coverage diagnostics</div>',
                 unsafe_allow_html=True)
     st.caption(
-        "Empirical coverage on the val-set calibration samples. "
-        "Coverage ≥ target is guaranteed by the conformal theorem."
+        "Empirical coverage on the val set (n_cal samples). "
+        "By the conformal theorem, achieved must be ≥ target."
     )
 
     rows = []
@@ -596,24 +671,23 @@ def render_coverage_diagnostics(conf_sig: dict):
         achieved = info.get("pooled", 0)
         ok       = achieved >= target - 0.005
         rows.append({
-            "Level":            f"{int(float(alpha_str)*100)}%",
-            "Target":           f"≥ {target:.0%}",
+            "Level":   f"{int(float(alpha_str)*100)}%",
+            "Target":  f"≥ {target:.0%}",
             "Achieved (pooled)": f"{achieved:.1%}",
-            "Status":           "✓ pass" if ok else "✗ fail",
+            "Status":  "✓ pass" if ok else "✗ fail",
         })
-
     st.dataframe(pd.DataFrame(rows), use_container_width=False, hide_index=True)
 
 
-def render_conformal_history(hist_df: pd.DataFrame):
+def render_conformal_history_table(hist_df: pd.DataFrame):
     if hist_df.empty:
-        st.info("Conformal signal history will appear after the first run.")
+        st.info("Conformal history will appear after the first run.")
         return
 
     disp = hist_df.sort_values("signal_date", ascending=False).copy()
 
     if "hit" in disp.columns:
-        hits  = (disp["hit"] == True).sum()   # noqa
+        hits  = (disp["hit"] == True).sum()  # noqa
         total = disp["hit"].notna().sum()
         hr    = hits / total if total > 0 else 0
         st.markdown(
@@ -641,8 +715,8 @@ def render_conformal_history(hist_df: pd.DataFrame):
         "top_pick":          "Pick",
         "top_mu":            "μ",
         "top_confidence":    "Conf.",
-        "interval_90_lo":    "CI lo (90%)",
-        "interval_90_hi":    "CI hi (90%)",
+        "interval_90_lo":    "CI lo",
+        "interval_90_hi":    "CI hi",
         "interval_90_width": "Width",
         "actual_return":     "Actual Return",
         "hit":               "Hit",
@@ -664,16 +738,15 @@ def render_conformal_history(hist_df: pd.DataFrame):
             disp[col] = disp[col].apply(
                 lambda x: "✓" if x is True else ("✗" if x is False else "—")
             )
-
     st.dataframe(disp, use_container_width=True, hide_index=True)
 
 
 def render_conformal_option(option: str, ncde_signals: dict,
-                            conf_signals: dict, master: pd.DataFrame):
+                             conf_signals: dict, master: pd.DataFrame):
     ncde_sig = ncde_signals.get(option, {})
     conf_sig = conf_signals.get(option, {})
 
-    render_conformal_hero(conf_sig, ncde_sig)
+    render_conformal_hero(conf_sig, option)
     render_model_metrics(conf_sig)
 
     st.markdown("<hr style='margin:1.5rem 0 0.5rem'>", unsafe_allow_html=True)
@@ -687,34 +760,61 @@ def render_conformal_option(option: str, ncde_signals: dict,
         format_func=lambda x: f"{int(float(x)*100)}%",
     )
 
-    st.markdown('<div class="section-hdr">ETF forecasts — NCDE vs conformal interval</div>',
-                unsafe_allow_html=True)
-    st.caption(
-        "**Thick coloured error bar** = conformal guaranteed interval at selected level.  "
-        "**Thin grey error bar** = raw NCDE ±σ. "
-        "Blue = top pick. The conformal bar is always at least as wide as ±σ."
+    # ── 1. Signal classification dot-plot ─────────────────────────────────────
+    st.markdown(
+        f'<div class="section-hdr">'
+        f'Signal classification — conformal {int(float(alpha_choice)*100)}% intervals'
+        f'</div>',
+        unsafe_allow_html=True,
     )
-    render_conformal_chart(conf_sig, ncde_sig, alpha_choice, option)
+    st.caption(
+        "Dot = μ. Bar = conformal CI. "
+        "🔵 top pick &nbsp;·&nbsp; "
+        "🟢 CI entirely positive (confident long) &nbsp;·&nbsp; "
+        "🔴 CI entirely negative (avoid) &nbsp;·&nbsp; "
+        "⚫ CI crosses zero (uncertain)."
+    )
+    render_signal_classification_chart(conf_sig, option, alpha_choice)
 
+    # ── 2. Width + q̂ chart ────────────────────────────────────────────────────
+    st.markdown(
+        '<div class="section-hdr">'
+        'Interval width vs NCDE 2σ, and q̂ miscalibration factor'
+        '</div>',
+        unsafe_allow_html=True,
+    )
+    st.caption(
+        "Left: how much wider the conformal interval is vs raw NCDE ±σ. "
+        "Right: q̂ — the inflation factor per ETF. "
+        "Red line = 1.0 (perfectly calibrated). Orange = q̂ > 1.5 (NCDE was overconfident here)."
+    )
+    render_interval_comparison_chart(conf_sig, ncde_sig, alpha_choice, option)
+
+    # ── 3. Full q̂ table ───────────────────────────────────────────────────────
+    st.markdown(
+        '<div class="section-hdr">Full conformal table — μ, σ, q̂ at all levels</div>',
+        unsafe_allow_html=True,
+    )
+    render_q_hat_table(conf_sig, option)
+
+    # ── 4. Coverage diagnostics ───────────────────────────────────────────────
     st.markdown("<hr style='margin:1.5rem 0 0.5rem'>", unsafe_allow_html=True)
     render_coverage_diagnostics(conf_sig)
 
+    # ── 5. History ────────────────────────────────────────────────────────────
     st.markdown("<hr style='margin:1.5rem 0 0.5rem'>", unsafe_allow_html=True)
     st.markdown('<div class="section-hdr">Conformal signal history</div>',
                 unsafe_allow_html=True)
-    conf_hist = load_conformal_history(option)
-    render_conformal_history(conf_hist)
+    render_conformal_history_table(load_conformal_history(option))
 
-    # Footer
+    # ── Footnote ──────────────────────────────────────────────────────────────
     if conf_sig:
-        n_cal   = conf_sig.get("n_cal", "?")
-        cal_p   = conf_sig.get("cal_period", "?")
-        cal_at  = _fmt_dt(conf_sig.get("calibrated_at", ""))
-        n_par   = conf_sig.get("model_n_params", 0)
         st.markdown(
             f"<div style='font-size:0.8rem;color:#9ca3af;margin-top:1rem'>"
-            f"Calibration set: {n_cal} samples &nbsp;·&nbsp; {cal_p} &nbsp;·&nbsp; "
-            f"Calibrated {cal_at} &nbsp;·&nbsp; Params: {n_par:,}"
+            f"Calibration set: {conf_sig.get('n_cal','?')} samples &nbsp;·&nbsp; "
+            f"{conf_sig.get('cal_period','?')} &nbsp;·&nbsp; "
+            f"Calibrated {_fmt_dt(conf_sig.get('calibrated_at',''))} &nbsp;·&nbsp; "
+            f"Params: {conf_sig.get('model_n_params', 0):,}"
             f"</div>",
             unsafe_allow_html=True,
         )
@@ -741,12 +841,11 @@ def main():
             st.rerun()
 
     with st.spinner("Loading signals and data..."):
-        signals          = load_signals()
-        conformal_sigs   = load_conformal_signals()
-        master           = load_master()
+        signals        = load_signals()
+        conformal_sigs = load_conformal_signals()
+        master         = load_master()
 
-    (tab_a, tab_b,
-     tab_conf_a, tab_conf_b) = st.tabs([
+    tab_a, tab_b, tab_ca, tab_cb = st.tabs([
         "📊 Option A — Fixed Income / Alts",
         "📈 Option B — Equity Sectors",
         "∂̂  Conformal — FI / Commodities",
@@ -759,25 +858,24 @@ def main():
     with tab_b:
         render_ncde_option("B", signals, master)
 
-    with tab_conf_a:
+    with tab_ca:
         with st.expander("ℹ️ What is conformal prediction?", expanded=False):
             st.markdown("""
-**Split conformal prediction** turns the NCDE's (μ, σ) into an interval
-`[μ − q̂·σ,  μ + q̂·σ]` with a **finite-sample, distribution-free** coverage guarantee.
+**Split conformal prediction** wraps the NCDE (μ, σ) into a guaranteed interval
+`[μ − q̂·σ, μ + q̂·σ]` where **q̂** is derived from val-set residuals.
 
-**How q̂ is computed:**
-1. Run the frozen model on the val set (10% holdout — never used in training).
-2. For each sample, score `s = |y − μ| / σ` (normalised absolute residual).
-3. At coverage 1−α, `q̂ = ⌈(n+1)(1−α)⌉/n`-th quantile of those scores.
+**Guarantee:** `P(true return ∈ interval) ≥ 1−α` on any future draw —
+no distributional assumptions required.
 
-**Guarantee:** `P(true return ∈ interval) ≥ 1−α` on any future exchangeable draw —
-regardless of whether the NCDE is well-specified.
-
-The point forecast (μ, pick ranking) is **completely unchanged**.
+**What you see here that you don't see in the NCDE tabs:**
+- **Signal classification** — whether the *entire* CI is positive (confident long), negative (avoid), or straddles zero
+- **q̂ per ETF** — the NCDE miscalibration factor. q̂ > 1.5 means the NCDE was significantly overconfident on that ETF during validation
+- **Coverage diagnostics** — verifies the theoretical guarantee is met on the calibration set
+- **CI covered** in history — tracks whether the actual return fell inside the interval
 """)
         render_conformal_option("A", signals, conformal_sigs, master)
 
-    with tab_conf_b:
+    with tab_cb:
         render_conformal_option("B", signals, conformal_sigs, master)
 
     st.markdown(
