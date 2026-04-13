@@ -435,21 +435,97 @@ def render_conformal_chart(conf_sig: dict, ncde_sig: dict,
         st.info("Need both NCDE and conformal signals to render comparison chart.")
         return
 
+    # SAFE ALPHA CONVERSION - FIXED
+    try:
+        # Convert alpha to float (handle both string and numeric inputs)
+        if isinstance(alpha, str):
+            alpha_clean = alpha.replace('%', '')
+            alpha_float = float(alpha_clean)
+            # If it's like "90" instead of "0.9", convert
+            if alpha_float > 1:
+                alpha_float = alpha_float / 100
+        else:
+            alpha_float = float(alpha)
+        
+        # Create the label safely
+        alpha_pct = int(alpha_float * 100)
+        ci_label = f"Conformal {alpha_pct}% CI"
+        
+        # Also create a string version for dictionary lookup
+        alpha_key = f"{alpha_float:.1f}" if alpha_float == 0.9 else f"{alpha_float:.1f}"
+        if alpha_float == 0.8:
+            alpha_key = "0.8"
+        elif alpha_float == 0.7:
+            alpha_key = "0.7"
+        elif alpha_float == 0.9:
+            alpha_key = "0.9"
+            
+    except (ValueError, TypeError) as e:
+        st.error(f"Invalid alpha value: {alpha}. Using default 0.9")
+        alpha_float = 0.9
+        alpha_pct = 90
+        ci_label = "Conformal 90% CI"
+        alpha_key = "0.9"
+
     tickers_all = cfg.FI_ETFS if option == "A" else cfg.EQ_ETFS
     ncde_fc  = ncde_sig.get("forecasts", {})
     conf_fc  = conf_sig.get("conformal_forecasts", {})
-    tickers  = [t for t in tickers_all
-                if t in ncde_fc and t in conf_fc
-                and alpha in conf_fc[t].get("intervals", {})]
+    
+    # Filter tickers that have data for the selected alpha level
+    tickers = []
+    for t in tickers_all:
+        if t in ncde_fc and t in conf_fc:
+            intervals = conf_fc[t].get("intervals", {})
+            # Try to find the interval with matching alpha
+            if alpha_key in intervals:
+                tickers.append(t)
+            else:
+                # Try to match by numeric value
+                for k in intervals.keys():
+                    try:
+                        if abs(float(k) - alpha_float) < 0.01:
+                            tickers.append(t)
+                            break
+                    except:
+                        pass
 
     if not tickers:
-        st.info("No tickers with complete conformal data yet.")
+        st.info(f"No tickers with conformal data for {alpha_pct}% level yet.")
         return
 
-    mus    = [ncde_fc[t]["mu"]    for t in tickers]
-    sigmas = [ncde_fc[t]["sigma"] for t in tickers]
-    iv_lo  = [conf_fc[t]["intervals"][alpha]["lo"] for t in tickers]
-    iv_hi  = [conf_fc[t]["intervals"][alpha]["hi"] for t in tickers]
+    # Build data arrays safely
+    mus = []
+    sigmas = []
+    iv_lo = []
+    iv_hi = []
+    
+    for t in tickers:
+        mus.append(float(ncde_fc[t]["mu"]))
+        sigmas.append(float(ncde_fc[t]["sigma"]))
+        
+        # Get the correct interval
+        intervals = conf_fc[t].get("intervals", {})
+        interval = None
+        
+        if alpha_key in intervals:
+            interval = intervals[alpha_key]
+        else:
+            # Try to find by numeric value
+            for k, v in intervals.items():
+                try:
+                    if abs(float(k) - alpha_float) < 0.01:
+                        interval = v
+                        break
+                except:
+                    pass
+        
+        if interval:
+            iv_lo.append(float(interval.get("lo", 0)))
+            iv_hi.append(float(interval.get("hi", 0)))
+        else:
+            # Fallback to NCDE ±σ if conformal not available
+            iv_lo.append(mus[-1] - sigmas[-1])
+            iv_hi.append(mus[-1] + sigmas[-1])
 
     top_pick = conf_sig.get("top_pick", "")
     colors   = ["#3a5bd9" if t == top_pick else "#9ca3af" for t in tickers]
@@ -457,47 +533,58 @@ def render_conformal_chart(conf_sig: dict, ncde_sig: dict,
     fig = go.Figure()
 
     # Conformal intervals — thick coloured bars
+    # Calculate error bar arrays
+    error_plus = [h - m for h, m in zip(iv_hi, mus)]
+    error_minus = [m - l for m, l in zip(mus, iv_lo)]
+    
     fig.add_trace(go.Bar(
-        name=f"Conformal {int(float(alpha)*100)}% CI",
-        x=mus, y=tickers, orientation="h",
+        name=ci_label,
+        x=mus, 
+        y=tickers, 
+        orientation="h",
         marker_color=[c + "44" for c in colors],
         error_x=dict(
             type="data",
             symmetric=False,
-            array   =[h - m for h, m in zip(iv_hi, mus)],
-            arrayminus=[m - l for m, l in zip(mus, iv_lo)],
+            array=error_plus,
+            arrayminus=error_minus,
             visible=True,
             color="#3a5bd9",
             thickness=4,
             width=8,
         ),
         customdata=[
-            [conf_fc[t]["intervals"][alpha]["lo"],
-             conf_fc[t]["intervals"][alpha]["hi"],
-             conf_fc[t]["intervals"][alpha]["width"],
-             conf_fc[t]["q_hat"].get(alpha, "?")]
-            for t in tickers
+            [iv_lo[i], iv_hi[i], iv_hi[i] - iv_lo[i], 
+             conf_fc[t].get("q_hat", {}).get(alpha_key, "?")]
+            for i, t in enumerate(tickers)
         ],
         hovertemplate=(
             "<b>%{y}</b><br>"
             "μ = %{x:.4f}<br>"
-            f"Conformal {int(float(alpha)*100)}% CI: "
+            f"{ci_label}: "
             "[%{customdata[0]:.4f}, %{customdata[1]:.4f}]<br>"
             "Width: %{customdata[2]:.4f}<br>"
             "q̂ = %{customdata[3]:.3f}"
+            "<extra></extra>"
         ),
     ))
 
     # NCDE raw σ — thin grey overlay
     fig.add_trace(go.Bar(
         name="NCDE ±σ (raw)",
-        x=mus, y=tickers, orientation="h",
+        x=mus, 
+        y=tickers, 
+        orientation="h",
         marker_color=colors,
         error_x=dict(
-            type="data", array=sigmas, visible=True,
-            color="#d1d5db", thickness=1.5, width=4,
+            type="data", 
+            array=sigmas, 
+            visible=True,
+            color="#d1d5db", 
+            thickness=1.5, 
+            width=4,
         ),
-        hovertemplate="<b>%{y}</b><br>μ = %{x:.4f}<br>σ = %{error_x.array:.4f}",
+        hovertemplate="<b>%{y}</b><br>μ = %{x:.4f}<br>σ = %{error_x.array:.4f}<extra></extra>",
     ))
 
     fig.add_vline(x=0, line_width=1, line_dash="dash", line_color="#9ca3af")
@@ -505,16 +592,19 @@ def render_conformal_chart(conf_sig: dict, ncde_sig: dict,
         barmode="overlay",
         height=max(280, len(tickers) * 34),
         margin=dict(l=0, r=0, t=8, b=0),
-        paper_bgcolor="white", plot_bgcolor="white",
+        paper_bgcolor="white", 
+        plot_bgcolor="white",
         xaxis=dict(title="Predicted next-day return",
-                   showgrid=True, gridcolor="#f3f4f6"),
+                   showgrid=True, 
+                   gridcolor="#f3f4f6",
+                   tickformat=".3f"),
         yaxis=dict(showgrid=False),
         legend=dict(orientation="h", yanchor="bottom", y=1.01,
                     xanchor="left", x=0),
     )
     st.plotly_chart(fig, use_container_width=True,
                     config={"displayModeBar": False},
-                    key=f"conf_chart_{option}_{alpha}")
+                    key=f"conf_chart_{option}_{alpha_pct}")
 
 
 def render_coverage_diagnostics(conf_sig: dict):
@@ -532,15 +622,26 @@ def render_coverage_diagnostics(conf_sig: dict):
 
     rows = []
     for alpha_str in sorted(diag.keys(), reverse=True):
-        info     = diag[alpha_str]
-        target   = info.get("target", 1 - float(alpha_str))
+        try:
+            alpha_float = float(alpha_str)
+            target = 1 - alpha_float
+        except:
+            target = 0.9
+            
+        info = diag[alpha_str]
         achieved = info.get("pooled", 0)
-        ok       = achieved >= target - 0.005
+        ok = achieved >= target - 0.005
+        
+        try:
+            level_pct = int(alpha_float * 100)
+        except:
+            level_pct = 90
+            
         rows.append({
-            "Level":            f"{int(float(alpha_str)*100)}%",
-            "Target":           f"≥ {target:.0%}",
+            "Level": f"{level_pct}%",
+            "Target": f"≥ {target:.0%}",
             "Achieved (pooled)": f"{achieved:.1%}",
-            "Status":           "✓ pass" if ok else "✗ fail",
+            "Status": "✓ pass" if ok else "✗ fail",
         })
 
     st.dataframe(pd.DataFrame(rows), use_container_width=False, hide_index=True)
