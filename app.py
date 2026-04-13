@@ -436,11 +436,13 @@ def render_conformal_chart(conf_sig: dict, ncde_sig: dict,
         return
 
     # Convert alpha to string key (as it appears in JSON)
-    # Your JSON uses "0.9", "0.8", "0.7" as strings
-    alpha_key = str(float(alpha)) if isinstance(alpha, str) else str(alpha)
-    
-    # For display
-    alpha_pct = int(float(alpha) * 100)
+    try:
+        alpha_float = float(alpha)
+        alpha_key = str(alpha_float)
+        alpha_pct = int(alpha_float * 100)
+    except:
+        alpha_key = "0.9"
+        alpha_pct = 90
     
     tickers_all = cfg.FI_ETFS if option == "A" else cfg.EQ_ETFS
     ncde_fc  = ncde_sig.get("forecasts", {})
@@ -451,7 +453,7 @@ def render_conformal_chart(conf_sig: dict, ncde_sig: dict,
     mus = []
     sigmas = []
     iv_los = []
-    ih_his = []
+    iv_his = []
     
     for t in tickers_all:
         if t not in ncde_fc or t not in conf_fc:
@@ -469,35 +471,50 @@ def render_conformal_chart(conf_sig: dict, ncde_sig: dict,
         hi = interval.get("hi", mu + sigma)
         
         tickers.append(t)
-        mus.append(mu)
-        sigmas.append(sigma)
-        iv_los.append(lo)
-        ih_his.append(hi)
+        mus.append(float(mu))
+        sigmas.append(float(sigma))
+        iv_los.append(float(lo))
+        iv_his.append(float(hi))
     
     if not tickers:
         st.warning(f"No data available for {alpha_pct}% confidence level")
         return
     
     top_pick = conf_sig.get("top_pick", "")
-    colors = ["#3a5bd9" if t == top_pick else "#9ca3af" for t in tickers]
+    
+    # Create simple colors - no transparency issues
+    bar_colors = []
+    for t in tickers:
+        if t == top_pick:
+            bar_colors.append("#3a5bd9")
+        else:
+            bar_colors.append("#9ca3af")
     
     # Create figure
     fig = go.Figure()
     
     # Add conformal interval trace (thick colored error bars)
+    # Calculate error bar values
+    error_plus = []
+    error_minus = []
+    for i in range(len(mus)):
+        error_plus.append(iv_his[i] - mus[i])
+        error_minus.append(mus[i] - iv_los[i])
+    
     fig.add_trace(go.Bar(
         name=f"Conformal {alpha_pct}% CI",
         x=mus,
         y=tickers,
         orientation='h',
-        marker_color=[c + '80' for c in colors],  # Add transparency
+        marker_color=bar_colors,
+        opacity=0.3,
         error_x=dict(
             type='data',
             symmetric=False,
-            array=[ih_his[i] - mus[i] for i in range(len(mus))],
-            arrayminus=[mus[i] - iv_los[i] for i in range(len(mus))],
+            array=error_plus,
+            arrayminus=error_minus,
             visible=True,
-            color='#3a5bd9',
+            color="#3a5bd9",
             thickness=6,
             width=10
         ),
@@ -510,7 +527,8 @@ def render_conformal_chart(conf_sig: dict, ncde_sig: dict,
         x=mus,
         y=tickers,
         orientation='h',
-        marker_color=colors,
+        marker_color=bar_colors,
+        opacity=0.8,
         error_x=dict(
             type='data',
             array=sigmas,
@@ -525,20 +543,27 @@ def render_conformal_chart(conf_sig: dict, ncde_sig: dict,
     # Add vertical line at zero
     fig.add_vline(x=0, line_width=1, line_dash="dash", line_color="#9ca3af")
     
+    # Calculate height based on number of tickers
+    chart_height = max(400, len(tickers) * 35)
+    
     # Update layout
     fig.update_layout(
         barmode='overlay',
-        height=max(300, len(tickers) * 35),
-        margin=dict(l=0, r=0, t=10, b=0),
+        height=chart_height,
+        margin=dict(l=10, r=10, t=30, b=30),
         paper_bgcolor='white',
         plot_bgcolor='white',
         xaxis=dict(
             title="Predicted next-day return",
             showgrid=True,
             gridcolor='#f3f4f6',
-            tickformat='.3f'
+            tickformat='.3f',
+            zeroline=False
         ),
-        yaxis=dict(showgrid=False),
+        yaxis=dict(
+            showgrid=False,
+            title=None
+        ),
         legend=dict(
             orientation='h',
             yanchor='bottom',
