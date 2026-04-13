@@ -1,11 +1,8 @@
 name: Daily Conformal Signals
 
-# Runs 5 minutes after the NCDE daily predict (23:00 UTC)
-# to ensure latest_signals.json is already uploaded before we wrap it.
-
 on:
   schedule:
-    - cron: "5 23 * * 1-5"   # 23:05 UTC Mon–Fri
+    - cron: "5 23 * * 1-5"
   workflow_dispatch:
     inputs:
       option:
@@ -48,23 +45,10 @@ jobs:
           if [ -f models/latest_signals_conformal.json ]; then
             echo "✓ Conformal signals generated"
 
-            python << 'EOF'
-import json
-
-with open('models/latest_signals_conformal.json') as f:
-    d = json.load(f)
-
-for opt in ['option_A', 'option_B']:
-    sig = d.get(opt)
-    if sig:
-        lo = sig.get('top_interval_90', {}).get('lo')
-        hi = sig.get('top_interval_90', {}).get('hi')
-
-        if lo is None or hi is None:
-            print(f"  {opt}: {sig['top_pick']}  mu={sig['top_mu']:.4f}  90% CI=[?, ?]")
-        else:
-            print(f"  {opt}: {sig['top_pick']}  mu={sig['top_mu']:.4f}  90% CI=[{lo:.4f}, {hi:.4f}]")
-EOF
+            python -c "import json; d=json.load(open('models/latest_signals_conformal.json')); \
+for opt in ['option_A','option_B']: \
+    sig=d.get(opt); \
+    print(f'  {opt}: {sig[\"top_pick\"]}  mu={sig[\"top_mu\"]:.4f}  90% CI=[{sig.get(\"top_interval_90\",{}).get(\"lo\",\"?\")}, {sig.get(\"top_interval_90\",{}).get(\"hi\",\"?\")}]') if sig else None"
 
           else
             echo "✗ No conformal signal file found"
