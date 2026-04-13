@@ -425,6 +425,22 @@ def render_conformal_hero(conf_sig: dict, ncde_sig: dict):
 """, unsafe_allow_html=True)
 
 
+def safe_float_convert(value, default=0.0):
+    """Safely convert a value to float, returning default if conversion fails."""
+    try:
+        if value is None:
+            return default
+        if isinstance(value, (int, float)):
+            return float(value)
+        if isinstance(value, str):
+            # Remove any non-numeric characters except decimal point and minus sign
+            cleaned = ''.join(c for c in value.strip() if c.isdigit() or c in '.-')
+            return float(cleaned) if cleaned else default
+        return default
+    except (ValueError, TypeError):
+        return default
+
+
 def render_conformal_chart(conf_sig: dict, ncde_sig: dict,
                            alpha: str, option: str):
     """
@@ -435,30 +451,27 @@ def render_conformal_chart(conf_sig: dict, ncde_sig: dict,
         st.info("Need both NCDE and conformal signals to render comparison chart.")
         return
 
-    # SAFE ALPHA CONVERSION - FIXED
+    # SAFE ALPHA CONVERSION
     try:
-        # Convert alpha to float (handle both string and numeric inputs)
         if isinstance(alpha, str):
-            alpha_clean = alpha.replace('%', '')
+            alpha_clean = alpha.replace('%', '').strip()
             alpha_float = float(alpha_clean)
-            # If it's like "90" instead of "0.9", convert
             if alpha_float > 1:
                 alpha_float = alpha_float / 100
         else:
             alpha_float = float(alpha)
         
-        # Create the label safely
-        alpha_pct = int(alpha_float * 100)
+        alpha_pct = int(round(alpha_float * 100))
         ci_label = f"Conformal {alpha_pct}% CI"
+        alpha_key = f"{alpha_float:.1f}"
         
-        # Also create a string version for dictionary lookup
-        alpha_key = f"{alpha_float:.1f}" if alpha_float == 0.9 else f"{alpha_float:.1f}"
-        if alpha_float == 0.8:
-            alpha_key = "0.8"
-        elif alpha_float == 0.7:
-            alpha_key = "0.7"
-        elif alpha_float == 0.9:
+        # Normalize alpha key to match expected format
+        if abs(alpha_float - 0.9) < 0.01:
             alpha_key = "0.9"
+        elif abs(alpha_float - 0.8) < 0.01:
+            alpha_key = "0.8"
+        elif abs(alpha_float - 0.7) < 0.01:
+            alpha_key = "0.7"
             
     except (ValueError, TypeError) as e:
         st.error(f"Invalid alpha value: {alpha}. Using default 0.9")
@@ -468,143 +481,181 @@ def render_conformal_chart(conf_sig: dict, ncde_sig: dict,
         alpha_key = "0.9"
 
     tickers_all = cfg.FI_ETFS if option == "A" else cfg.EQ_ETFS
-    ncde_fc  = ncde_sig.get("forecasts", {})
-    conf_fc  = conf_sig.get("conformal_forecasts", {})
+    ncde_fc = ncde_sig.get("forecasts", {})
+    conf_fc = conf_sig.get("conformal_forecasts", {})
     
-    # Filter tickers that have data for the selected alpha level
+    # Build data arrays safely with validation
     tickers = []
-    for t in tickers_all:
-        if t in ncde_fc and t in conf_fc:
-            intervals = conf_fc[t].get("intervals", {})
-            # Try to find the interval with matching alpha
-            if alpha_key in intervals:
-                tickers.append(t)
-            else:
-                # Try to match by numeric value
-                for k in intervals.keys():
-                    try:
-                        if abs(float(k) - alpha_float) < 0.01:
-                            tickers.append(t)
-                            break
-                    except:
-                        pass
-
-    if not tickers:
-        st.info(f"No tickers with conformal data for {alpha_pct}% level yet.")
-        return
-
-    # Build data arrays safely
     mus = []
     sigmas = []
     iv_lo = []
     iv_hi = []
+    customdata_list = []
     
-    for t in tickers:
-        mus.append(float(ncde_fc[t]["mu"]))
-        sigmas.append(float(ncde_fc[t]["sigma"]))
+    for t in tickers_all:
+        if t not in ncde_fc or t not in conf_fc:
+            continue
+            
+        # Safely extract NCDE values
+        mu = safe_float_convert(ncde_fc[t].get("mu"), 0.0)
+        sigma = safe_float_convert(ncde_fc[t].get("sigma"), 0.0)
         
-        # Get the correct interval
+        # Get conformal interval
         intervals = conf_fc[t].get("intervals", {})
         interval = None
         
+        # Try exact match first
         if alpha_key in intervals:
             interval = intervals[alpha_key]
         else:
             # Try to find by numeric value
             for k, v in intervals.items():
                 try:
-                    if abs(float(k) - alpha_float) < 0.01:
+                    if abs(safe_float_convert(k, 0) - alpha_float) < 0.01:
                         interval = v
                         break
                 except:
                     pass
         
         if interval:
-            iv_lo.append(float(interval.get("lo", 0)))
-            iv_hi.append(float(interval.get("hi", 0)))
+            lo = safe_float_convert(interval.get("lo"), mu - sigma)
+            hi = safe_float_convert(interval.get("hi"), mu + sigma)
         else:
-            # Fallback to NCDE ±σ if conformal not available
-            iv_lo.append(mus[-1] - sigmas[-1])
-            iv_hi.append(mus[-1] + sigmas[-1])
-
-    top_pick = conf_sig.get("top_pick", "")
-    colors   = ["#3a5bd9" if t == top_pick else "#9ca3af" for t in tickers]
-
-    fig = go.Figure()
-
-    # Conformal intervals — thick coloured bars
-    # Calculate error bar arrays
-    error_plus = [h - m for h, m in zip(iv_hi, mus)]
-    error_minus = [m - l for m, l in zip(mus, iv_lo)]
+            # Fallback to NCDE ±σ
+            lo = mu - sigma
+            hi = mu + sigma
+        
+        # Only add if we have valid numbers
+        if not np.isnan(mu) and not np.isnan(sigma):
+            tickers.append(t)
+            mus.append(mu)
+            sigmas.append(sigma)
+            iv_lo.append(lo)
+            iv_hi.append(hi)
+            
+            # Get q_hat value safely
+            q_hat = conf_fc[t].get("q_hat", {})
+            q_val = safe_float_convert(q_hat.get(alpha_key, q_hat.get(str(alpha_float), 0)), 0)
+            
+            customdata_list.append([lo, hi, hi - lo, q_val])
     
-    fig.add_trace(go.Bar(
-        name=ci_label,
-        x=mus, 
-        y=tickers, 
-        orientation="h",
-        marker_color=[c + "44" for c in colors],
-        error_x=dict(
-            type="data",
-            symmetric=False,
-            array=error_plus,
-            arrayminus=error_minus,
-            visible=True,
-            color="#3a5bd9",
-            thickness=4,
-            width=8,
-        ),
-        customdata=[
-            [iv_lo[i], iv_hi[i], iv_hi[i] - iv_lo[i], 
-             conf_fc[t].get("q_hat", {}).get(alpha_key, "?")]
-            for i, t in enumerate(tickers)
-        ],
-        hovertemplate=(
-            "<b>%{y}</b><br>"
-            "μ = %{x:.4f}<br>"
-            f"{ci_label}: "
-            "[%{customdata[0]:.4f}, %{customdata[1]:.4f}]<br>"
-            "Width: %{customdata[2]:.4f}<br>"
-            "q̂ = %{customdata[3]:.3f}"
-            "<extra></extra>"
-        ),
-    ))
-
-    # NCDE raw σ — thin grey overlay
-    fig.add_trace(go.Bar(
-        name="NCDE ±σ (raw)",
-        x=mus, 
-        y=tickers, 
-        orientation="h",
-        marker_color=colors,
-        error_x=dict(
-            type="data", 
-            array=sigmas, 
-            visible=True,
-            color="#d1d5db", 
-            thickness=1.5, 
-            width=4,
-        ),
-        hovertemplate="<b>%{y}</b><br>μ = %{x:.4f}<br>σ = %{error_x.array:.4f}<extra></extra>",
-    ))
-
+    if not tickers:
+        st.warning(f"No valid ticker data available for {alpha_pct}% confidence level.")
+        return
+    
+    # Validate all arrays have the same length
+    n_tickers = len(tickers)
+    if not (len(mus) == n_tickers and len(sigmas) == n_tickers and 
+            len(iv_lo) == n_tickers and len(iv_hi) == n_tickers):
+        st.error("Data length mismatch - cannot render chart")
+        return
+    
+    top_pick = conf_sig.get("top_pick", "")
+    colors = ["#3a5bd9" if t == top_pick else "#9ca3af" for t in tickers]
+    
+    # Calculate error bar arrays (ensure they're lists of floats)
+    error_plus = [float(hi - mu) for hi, mu in zip(iv_hi, mus)]
+    error_minus = [float(mu - lo) for mu, lo in zip(mus, iv_lo)]
+    
+    # Create figure
+    fig = go.Figure()
+    
+    # Add conformal intervals trace
+    try:
+        fig.add_trace(go.Bar(
+            name=ci_label,
+            x=[float(m) for m in mus],
+            y=tickers,
+            orientation="h",
+            marker_color=[c + "44" for c in colors],
+            error_x=dict(
+                type="data",
+                symmetric=False,
+                array=error_plus,
+                arrayminus=error_minus,
+                visible=True,
+                color="#3a5bd9",
+                thickness=4,
+                width=8,
+            ),
+            customdata=customdata_list,
+            hovertemplate=(
+                "<b>%{y}</b><br>"
+                "μ = %{x:.4f}<br>"
+                f"{ci_label}: "
+                "[%{customdata[0]:.4f}, %{customdata[1]:.4f}]<br>"
+                "Width: %{customdata[2]:.4f}<br>"
+                "q̂ = %{customdata[3]:.3f}"
+                "<extra></extra>"
+            ),
+        ))
+    except Exception as e:
+        st.error(f"Error adding conformal trace: {e}")
+        st.write("Debug info:")
+        st.write(f"mus: {mus}")
+        st.write(f"error_plus: {error_plus}")
+        st.write(f"error_minus: {error_minus}")
+        return
+    
+    # Add NCDE raw σ trace
+    try:
+        fig.add_trace(go.Bar(
+            name="NCDE ±σ (raw)",
+            x=[float(m) for m in mus],
+            y=tickers,
+            orientation="h",
+            marker_color=colors,
+            error_x=dict(
+                type="data",
+                array=[float(s) for s in sigmas],
+                visible=True,
+                color="#d1d5db",
+                thickness=1.5,
+                width=4,
+            ),
+            hovertemplate="<b>%{y}</b><br>μ = %{x:.4f}<br>σ = %{error_x.array:.4f}<extra></extra>",
+        ))
+    except Exception as e:
+        st.error(f"Error adding NCDE trace: {e}")
+        return
+    
+    # Add vertical line at zero
     fig.add_vline(x=0, line_width=1, line_dash="dash", line_color="#9ca3af")
-    fig.update_layout(
-        barmode="overlay",
-        height=max(280, len(tickers) * 34),
-        margin=dict(l=0, r=0, t=8, b=0),
-        paper_bgcolor="white", 
-        plot_bgcolor="white",
-        xaxis=dict(title="Predicted next-day return",
-                   showgrid=True, 
-                   gridcolor="#f3f4f6",
-                   tickformat=".3f"),
-        yaxis=dict(showgrid=False),
-        legend=dict(orientation="h", yanchor="bottom", y=1.01,
-                    xanchor="left", x=0),
+    
+    # Update layout
+    try:
+        fig.update_layout(
+            barmode="overlay",
+            height=max(280, len(tickers) * 34),
+            margin=dict(l=0, r=0, t=8, b=0),
+            paper_bgcolor="white",
+            plot_bgcolor="white",
+            xaxis=dict(
+                title="Predicted next-day return",
+                showgrid=True,
+                gridcolor="#f3f4f6",
+                tickformat=".3f"
+            ),
+            yaxis=dict(showgrid=False),
+            legend=dict(
+                orientation="h",
+                yanchor="bottom",
+                y=1.01,
+                xanchor="left",
+                x=0
+            ),
+        )
+    except Exception as e:
+        st.error(f"Error updating layout: {e}")
+        return
+    
+    # Display chart
+    st.plotly_chart(
+        fig,
+        use_container_width=True,
+        config={"displayModeBar": False},
+        key=f"conf_chart_{option}_{alpha_pct}"
     )
-    st.plotly_chart(fig, use_container_width=True,
-                    config={"displayModeBar": False},
-                    key=f"conf_chart_{option}_{alpha_pct}")
 
 
 def render_coverage_diagnostics(conf_sig: dict):
@@ -655,7 +706,7 @@ def render_conformal_history(hist_df: pd.DataFrame):
     disp = hist_df.sort_values("signal_date", ascending=False).copy()
 
     if "hit" in disp.columns:
-        hits  = (disp["hit"] == True).sum()   # noqa
+        hits  = (disp["hit"] == True).sum()
         total = disp["hit"].notna().sum()
         hr    = hits / total if total > 0 else 0
         st.markdown(
@@ -744,92 +795,4 @@ def render_conformal_option(option: str, ncde_signals: dict,
     st.markdown("<hr style='margin:1.5rem 0 0.5rem'>", unsafe_allow_html=True)
     st.markdown('<div class="section-hdr">Conformal signal history</div>',
                 unsafe_allow_html=True)
-    conf_hist = load_conformal_history(option)
-    render_conformal_history(conf_hist)
-
-    # Footer
-    if conf_sig:
-        n_cal   = conf_sig.get("n_cal", "?")
-        cal_p   = conf_sig.get("cal_period", "?")
-        cal_at  = _fmt_dt(conf_sig.get("calibrated_at", ""))
-        n_par   = conf_sig.get("model_n_params", 0)
-        st.markdown(
-            f"<div style='font-size:0.8rem;color:#9ca3af;margin-top:1rem'>"
-            f"Calibration set: {n_cal} samples &nbsp;·&nbsp; {cal_p} &nbsp;·&nbsp; "
-            f"Calibrated {cal_at} &nbsp;·&nbsp; Params: {n_par:,}"
-            f"</div>",
-            unsafe_allow_html=True,
-        )
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# MAIN
-# ═══════════════════════════════════════════════════════════════════════════════
-
-def main():
-    st.markdown(
-        "<h2 style='margin-bottom:0.2rem'>∂ NCDE — Neural CDE ETF Signal Engine</h2>"
-        "<p style='color:#6b7280;margin-top:0'>"
-        "Continuous-time &nbsp;·&nbsp; Controlled Differential Equations "
-        "&nbsp;·&nbsp; Macro control path &nbsp;·&nbsp; μ + σ forecasts"
-        "&nbsp;·&nbsp; Conformal prediction intervals</p>",
-        unsafe_allow_html=True,
-    )
-
-    col1, col2 = st.columns([6, 1])
-    with col2:
-        if st.button("🔄 Refresh", help="Clear cache and reload signals"):
-            st.cache_data.clear()
-            st.rerun()
-
-    with st.spinner("Loading signals and data..."):
-        signals          = load_signals()
-        conformal_sigs   = load_conformal_signals()
-        master           = load_master()
-
-    (tab_a, tab_b,
-     tab_conf_a, tab_conf_b) = st.tabs([
-        "📊 Option A — Fixed Income / Alts",
-        "📈 Option B — Equity Sectors",
-        "∂̂  Conformal — FI / Commodities",
-        "∂̂  Conformal — Equities",
-    ])
-
-    with tab_a:
-        render_ncde_option("A", signals, master)
-
-    with tab_b:
-        render_ncde_option("B", signals, master)
-
-    with tab_conf_a:
-        with st.expander("ℹ️ What is conformal prediction?", expanded=False):
-            st.markdown("""
-**Split conformal prediction** turns the NCDE's (μ, σ) into an interval
-`[μ − q̂·σ,  μ + q̂·σ]` with a **finite-sample, distribution-free** coverage guarantee.
-
-**How q̂ is computed:**
-1. Run the frozen model on the val set (10% holdout — never used in training).
-2. For each sample, score `s = |y − μ| / σ` (normalised absolute residual).
-3. At coverage 1−α, `q̂ = ⌈(n+1)(1−α)⌉/n`-th quantile of those scores.
-
-**Guarantee:** `P(true return ∈ interval) ≥ 1−α` on any future exchangeable draw —
-regardless of whether the NCDE is well-specified.
-
-The point forecast (μ, pick ranking) is **completely unchanged**.
-""")
-        render_conformal_option("A", signals, conformal_sigs, master)
-
-    with tab_conf_b:
-        render_conformal_option("B", signals, conformal_sigs, master)
-
-    st.markdown(
-        "<hr style='margin:2rem 0 1rem'>"
-        "<div style='text-align:center;font-size:0.8rem;color:#9ca3af'>"
-        "P2-ETF-NCDE-ENGINE &nbsp;·&nbsp; Research only &nbsp;·&nbsp; Not financial advice"
-        "</div>",
-        unsafe_allow_html=True,
-    )
-
-
-if __name__ == "__main__":
-    main()
+   
