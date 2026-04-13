@@ -1,7 +1,7 @@
 name: Daily Conformal Signals
 
-# Runs 5 minutes after the NCDE daily predict (23:00 UTC) to ensure
-# latest_signals.json is already uploaded before we wrap it.
+# Runs 5 minutes after the NCDE daily predict (23:00 UTC)
+# to ensure latest_signals.json is already uploaded before we wrap it.
 
 on:
   schedule:
@@ -16,7 +16,7 @@ on:
 jobs:
   conformal-predict:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 30
 
     steps:
       - name: Checkout
@@ -43,17 +43,26 @@ jobs:
         run: |
           if [ -f models/latest_signals_conformal.json ]; then
             echo "✓ Conformal signals generated"
-            python -c "
+
+            python << 'EOF'
 import json
+
 with open('models/latest_signals_conformal.json') as f:
     d = json.load(f)
+
 for opt in ['option_A', 'option_B']:
     sig = d.get(opt)
     if sig:
-        print(f\"  {opt}: {sig['top_pick']}  mu={sig['top_mu']:.4f}  \
-90% CI=[{sig.get('top_interval_90', {}).get('lo', '?'):.4f}, \
-{sig.get('top_interval_90', {}).get('hi', '?'):.4f}]\")
-"
+        lo = sig.get('top_interval_90', {}).get('lo')
+        hi = sig.get('top_interval_90', {}).get('hi')
+
+        # Handle missing values safely
+        if lo is None or hi is None:
+            print(f"  {opt}: {sig['top_pick']}  mu={sig['top_mu']:.4f}  90% CI=[?, ?]")
+        else:
+            print(f"  {opt}: {sig['top_pick']}  mu={sig['top_mu']:.4f}  90% CI=[{lo:.4f}, {hi:.4f}]")
+EOF
+
           else
             echo "✗ No conformal signal file found"
             exit 1
