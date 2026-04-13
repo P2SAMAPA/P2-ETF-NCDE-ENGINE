@@ -4,68 +4,28 @@ on:
   schedule:
     - cron: "5 23 * * 1-5"
   workflow_dispatch:
-    inputs:
-      option:
-        description: "Option to run (A / B / both)"
-        required: false
-        default: "both"
 
 jobs:
   conformal-predict:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
 
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
+      - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-          cache: "pip"
 
-      - name: Install dependencies
-        run: pip install -r requirements.txt
+      - run: pip install -r requirements.txt
 
       - name: Run conformal predict
-        env:
-          HF_TOKEN: ${{ secrets.HF_TOKEN }}
-        run: |
-          OPTION="${{ github.event.inputs.option }}"
-          if [ -z "$OPTION" ]; then
-            OPTION="both"
-          fi
+        run: python -m conformal.predict_conformal --option both
 
-          echo "Running conformal prediction for option: $OPTION"
-          python -m conformal.predict_conformal --option "$OPTION"
-
-      - name: Summary
+      - name: Check output
         run: |
           if [ -f models/latest_signals_conformal.json ]; then
-            echo "✓ Conformal signals generated"
-
-            cat << 'EOF' > summary.py
-import json
-
-with open('models/latest_signals_conformal.json') as f:
-    d = json.load(f)
-
-for opt in ['option_A', 'option_B']:
-    sig = d.get(opt)
-    if sig:
-        lo = sig.get('top_interval_90', {}).get('lo')
-        hi = sig.get('top_interval_90', {}).get('hi')
-
-        if lo is None or hi is None:
-            print(f"  {opt}: {sig['top_pick']}  mu={sig['top_mu']:.4f}  90% CI=[?, ?]")
-        else:
-            print(f"  {opt}: {sig['top_pick']}  mu={sig['top_mu']:.4f}  90% CI=[{lo:.4f}, {hi:.4f}]")
-EOF
-
-            python summary.py
-
+            echo "SUCCESS: file exists"
           else
-            echo "✗ No conformal signal file found"
+            echo "ERROR: file missing"
             exit 1
           fi
