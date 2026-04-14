@@ -1,15 +1,19 @@
 # conformal/predict_conformal.py — Wrap NCDE signals with conformal intervals
 #
-# SELF-HEALING: if conformal_option{X}.json is missing (first run or after
-# a model retrain), this script auto-runs calibration inline before wrapping.
-# No separate "run calibrate first" step is required.
+# Supports two score types (determined by what calibrate.py used):
 #
-# Reads  : models/conformal_option{A|B}.json   (calibration thresholds)
-#           HF signals/latest_signals.json       (raw NCDE mu/sigma)
+#   absolute   (recommended):
+#     interval = [mu - q̂,  mu + q̂]
+#     q̂ is in return units — directly interpretable (e.g. ±1.5%)
 #
-# Writes : models/latest_signals_conformal.json
-#           HF conformal/latest_signals_conformal.json
-#           HF conformal/signal_history_conformal_{A|B}.json
+#   normalised (original):
+#     interval = [mu - q̂·sigma,  mu + q̂·sigma]
+#     q̂ is in sigma-units — only meaningful if sigma ≈ return scale
+#
+# The score_type is read from the calibration JSON automatically.
+# No flag needed — just run predict_conformal.py as normal.
+#
+# Self-healing: auto-calibrates (absolute mode) if params missing.
 #
 # Usage:
 #   python -m conformal.predict_conformal --option both
@@ -28,7 +32,6 @@ import config as cfg
 # ── Loaders ───────────────────────────────────────────────────────────────────
 
 def load_ncde_signals() -> dict:
-    """Load latest NCDE signals — local first, then HF."""
     local = os.path.join(cfg.MODELS_DIR, "latest_signals.json")
     if os.path.exists(local):
         with open(local) as f:
@@ -51,10 +54,6 @@ def load_ncde_signals() -> dict:
 
 
 def load_conformal_params(option: str) -> dict | None:
-    """
-    Return conformal params dict, or None if not found anywhere.
-    Never raises — caller decides what to do when None is returned.
-    """
     local = os.path.join(cfg.MODELS_DIR, f"conformal_option{option}.json")
     if os.path.exists(local):
         with open(local) as f:
@@ -71,34 +70,31 @@ def load_conformal_params(option: str) -> dict | None:
         with open(path) as f:
             return json.load(f)
     except Exception:
-        return None   # triggers auto-calibration in caller
+        return None
 
 
 # ── Auto-calibration ──────────────────────────────────────────────────────────
 
 def ensure_calibrated(option: str) -> dict:
-    """
-    Return conformal params. If missing, run calibration first.
-    Raises FileNotFoundError with a clear message if no model exists.
-    """
     params = load_conformal_params(option)
     if params is not None:
-        print(f"[predict_conformal] Conformal params loaded for Option {option}.")
+        score_type = params.get("score_type", "unknown")
+        print(f"[predict_conformal] Params loaded for Option {option} "
+              f"(score_type={score_type}).")
         return params
 
     print(f"[predict_conformal] No conformal params for Option {option} — "
-          f"running calibration now (this is normal on first run)...")
+          f"auto-calibrating with score_type=absolute...")
 
     model_path = os.path.join(cfg.MODELS_DIR, f"ncde_option{option}_best.pt")
     if not os.path.exists(model_path):
         raise FileNotFoundError(
             f"No trained model at {model_path}. "
-            f"Run  python train.py --option {option}  first, "
-            f"then this script will calibrate automatically."
+            f"Run  python train.py --option {option}  first."
         )
 
     from conformal.calibrate import calibrate_option
-    calibrate_option(option)
+    calibrate_option(option, score_type="absolute")
 
     params = load_conformal_params(option)
     if params is None:
@@ -110,14 +106,28 @@ def ensure_calibrated(option: str) -> dict:
 
 # ── Core wrapping logic ───────────────────────────────────────────────────────
 
+def _compute_interval(mu: float, sigma: float, q: float,
+                      score_type: str) -> tuple[float, float]:
+    """
+    absolute  : half-width = q           (q is in return units, e.g. 0.015 = 1.5%)
+    normalised: half-width = q * sigma   (q is in sigma units)
+    """
+    if score_type == "absolute":
+        half = q
+    else:
+        half = q * sigma
+    return mu - half, mu + half
+
+
 def wrap_signal(ncde_signal: dict, conformal_params: dict) -> dict:
     """
     Wrap a raw NCDE signal with conformal prediction intervals.
     Point forecast (mu, top_pick ranking) is completely unchanged.
     """
-    forecasts = ncde_signal.get("forecasts", {})
-    quantiles = conformal_params["quantiles"]
-    tickers   = conformal_params["tickers"]
+    forecasts  = ncde_signal.get("forecasts", {})
+    quantiles  = conformal_params["quantiles"]
+    tickers    = conformal_params["tickers"]
+    score_type = conformal_params.get("score_type", "normalised")
 
     conformal_forecasts = {}
     for ticker in tickers:
@@ -131,12 +141,12 @@ def wrap_signal(ncde_signal: dict, conformal_params: dict) -> dict:
         intervals = {}
         q_hat     = {}
         for alpha_str, q_info in quantiles.items():
-            q    = q_info["per_etf"].get(ticker, q_info["pooled"])
-            half = q * sigma
+            q      = q_info["per_etf"].get(ticker, q_info["pooled"])
+            lo, hi = _compute_interval(mu, sigma, q, score_type)
             intervals[alpha_str] = {
-                "lo":    round(mu - half, 6),
-                "hi":    round(mu + half, 6),
-                "width": round(2 * half,  6),
+                "lo":    round(lo,       6),
+                "hi":    round(hi,       6),
+                "width": round(hi - lo,  6),
             }
             q_hat[alpha_str] = round(q, 6)
 
@@ -146,6 +156,7 @@ def wrap_signal(ncde_signal: dict, conformal_params: dict) -> dict:
             "confidence": conf,
             "intervals":  intervals,
             "q_hat":      q_hat,
+            "score_type": score_type,
         }
 
     top_pick        = ncde_signal["top_pick"]
@@ -155,6 +166,13 @@ def wrap_signal(ncde_signal: dict, conformal_params: dict) -> dict:
                        .get(top_pick, {})
                        .get("intervals", {})
                        .get("0.9", {}))
+
+    # Human-readable label for the UI
+    pooled_q_90 = quantiles.get("0.9", {}).get("pooled", 0)
+    if score_type == "absolute":
+        q_label = f"±{pooled_q_90*100:.3f}% return  (pooled 90%)"
+    else:
+        q_label = f"q̂={pooled_q_90:.4f} σ-units  (pooled 90%)"
 
     return {
         "option":               ncde_signal.get("option"),
@@ -167,14 +185,16 @@ def wrap_signal(ncde_signal: dict, conformal_params: dict) -> dict:
         "top_mu":               top_mu,
         "top_confidence":       top_confidence,
         "top_interval_90":      top_interval_90,
+        "score_type":           score_type,
+        "q_label":              q_label,
         "alpha_levels":         conformal_params["alpha_levels"],
         "n_cal":                conformal_params["n_cal"],
         "cal_period":           (f"{conformal_params['val_start']} → "
                                  f"{conformal_params['val_end']}"),
         "calibrated_at":        conformal_params["calibrated_at"],
         "coverage_diagnostics": conformal_params["coverage"],
+        "score_stats":          conformal_params.get("score_stats", {}),
         "conformal_forecasts":  conformal_forecasts,
-        # carry-through from NCDE
         "regime_context":       ncde_signal.get("regime_context"),
         "macro_stress":         ncde_signal.get("macro_stress"),
         "test_ann_return":      ncde_signal.get("test_ann_return"),
@@ -191,7 +211,6 @@ def wrap_signal(ncde_signal: dict, conformal_params: dict) -> dict:
 def save_and_upload(sig_A=None, sig_B=None):
     os.makedirs(cfg.MODELS_DIR, exist_ok=True)
 
-    # Never write {} — use None for options that didn't run
     combined = {
         "generated_at": datetime.utcnow().isoformat(),
         "option_A":     sig_A or None,
@@ -257,12 +276,13 @@ def _update_conformal_history(sig: dict, option: str):
         "top_mu":            sig["top_mu"],
         "top_confidence":    sig["top_confidence"],
         "generated_at":      sig["generated_at"],
+        "score_type":        sig.get("score_type", "unknown"),
         "interval_90_lo":    iv90.get("lo"),
         "interval_90_hi":    iv90.get("hi"),
         "interval_90_width": iv90.get("width"),
         "actual_return":     sig.get("actual_return"),
         "hit":               sig.get("hit"),
-        "interval_covered":  None,   # backfilled next run
+        "interval_covered":  None,
     }
 
     existing = {r["signal_date"] for r in history}
@@ -307,17 +327,11 @@ def _update_conformal_history(sig: dict, option: str):
 # ── Per-option runner ─────────────────────────────────────────────────────────
 
 def run_option(option: str, ncde_raw: dict) -> dict | None:
-    """
-    Returns a fully-wrapped conformal signal dict, or None.
-    Never returns {} — callers can rely on truthiness check.
-    """
     key      = f"option_{option}"
     ncde_sig = ncde_raw.get(key)
 
-    # Treat missing / None / {} / incomplete dicts the same way
     if not ncde_sig or not isinstance(ncde_sig, dict) or "top_pick" not in ncde_sig:
-        print(f"[predict_conformal] NCDE Option {option} signal is absent or "
-              f"incomplete — skipping.")
+        print(f"[predict_conformal] NCDE Option {option} signal absent — skipping.")
         return None
 
     try:
@@ -329,12 +343,14 @@ def run_option(option: str, ncde_raw: dict) -> dict | None:
         print(f"[predict_conformal] Option {option} calibration error: {e}")
         return None
 
-    wrapped = wrap_signal(ncde_sig, params)
-    iv90    = wrapped.get("top_interval_90", {})
+    wrapped    = wrap_signal(ncde_sig, params)
+    iv90       = wrapped.get("top_interval_90", {})
+    score_type = wrapped.get("score_type", "?")
     print(f"[predict_conformal]   Option {option}: {wrapped['top_pick']}  "
           f"μ={wrapped['top_mu']:.4f}  "
           f"90% CI=[{iv90.get('lo','?')}, {iv90.get('hi','?')}]  "
-          f"for {wrapped['signal_date']}  (n_cal={wrapped['n_cal']})")
+          f"({score_type})  "
+          f"signal_date={wrapped['signal_date']}")
     return wrapped
 
 
@@ -344,7 +360,8 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(
         description=(
             "Wrap NCDE signals with conformal prediction intervals. "
-            "Auto-calibrates on first run if conformal params are missing."
+            "Score type is read from calibration JSON automatically. "
+            "Auto-calibrates with score_type=absolute if params are missing."
         )
     )
     parser.add_argument("--option", choices=["A", "B", "both"], default="both")
