@@ -792,8 +792,9 @@ def render_conformal_history_table(hist_df: pd.DataFrame):
 
 def render_conformal_option(option: str, ncde_signals: dict,
                              conf_signals: dict, master: pd.DataFrame):
-    ncde_sig = ncde_signals.get(option, {})
-    conf_sig = conf_signals.get(option, {})
+    ncde_sig   = ncde_signals.get(option, {})
+    conf_sig   = conf_signals.get(option, {})
+    score_type = conf_sig.get("score_type", "normalised") if conf_sig else "normalised"
 
     render_conformal_hero(conf_sig, option)
     render_model_metrics(conf_sig)
