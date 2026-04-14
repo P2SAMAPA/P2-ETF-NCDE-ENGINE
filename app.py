@@ -423,7 +423,15 @@ def render_conformal_hero(conf_sig: dict, option: str):
     if len(ranked) > 1: runner += f"2nd: **{ranked[1][0]}** μ={ranked[1][1]:.4f}"
     if len(ranked) > 2: runner += f"&nbsp;&nbsp;3rd: **{ranked[2][0]}** μ={ranked[2][1]:.4f}"
 
-    q_str = f"{q_90:.3f}" if isinstance(q_90, float) else str(q_90)
+    # Score-type-aware q̂ label
+    score_type = conf_sig.get("score_type", "normalised")
+    if isinstance(q_90, float):
+        if score_type == "absolute":
+            q_str = f"±{q_90*100:.3f}% half-width"
+        else:
+            q_str = f"q̂={q_90:.3f} × σ"
+    else:
+        q_str = str(q_90)
 
     st.markdown(f"""
 <div class="hero">{pick}</div>
@@ -433,7 +441,7 @@ def render_conformal_hero(conf_sig: dict, option: str):
 <div style="margin-top:0.5rem">
   {sig_class}&nbsp;
   <span class="badge-a">90% CI {iv_str}</span>&nbsp;
-  <span class="badge-a">q̂={q_str} × σ</span>
+  <span class="badge-a">{q_str}</span>
 </div>
 <div style="margin-top:0.4rem">
   <span class="badge-a">cal n={n_cal} &nbsp;·&nbsp; {cal_p}</span>
@@ -553,22 +561,42 @@ def render_interval_comparison_chart(conf_sig: dict, ncde_sig: dict,
     conf_w    = [conf_fc[t]["intervals"][alpha]["width"]            for t in valid]
     q_hats    = [conf_fc[t]["q_hat"].get(alpha, 1.0)               for t in valid]
     top_pick  = conf_sig.get("top_pick", "")
+    score_type = conf_sig.get("score_type", "normalised")
 
     width_colors = ["#3a5bd9" if t == top_pick else "#6b7280" for t in valid]
-    q_colors     = []
+
+    # In absolute mode q̂ is a return value (e.g. 0.015), not a multiplier.
+    # "orange if > 1.5" only makes sense for normalised mode.
+    q_colors = []
     for t, q in zip(valid, q_hats):
         if t == top_pick:
             q_colors.append("#3a5bd9")
-        elif q > 1.5:
+        elif score_type == "normalised" and q > 1.5:
             q_colors.append("#f59e0b")   # orange = NCDE badly overconfident
         else:
             q_colors.append("#9ca3af")
+
+    q_panel_title = (
+        "q̂ per ETF  (red line = 1.0, perfectly calibrated)"
+        if score_type == "normalised"
+        else "q̂ per ETF  (return half-width in %, red line = pooled 90%)"
+    )
+    q_axis_label = "q̂" if score_type == "normalised" else "q̂  (return units)"
+
+    # For absolute mode draw red line at the pooled q̂ value (not 1.0)
+    q_ref_line = 1.0
+    if score_type == "absolute":
+        q_ref_line = conformal_params_pooled if (
+            conformal_params_pooled := conf_sig.get(
+                "coverage_diagnostics", {}
+            ).get("0.9", {}).get("pooled", 1.0)
+        ) else float(np.mean(q_hats)) if q_hats else 1.0
 
     fig = make_subplots(
         rows=1, cols=2,
         subplot_titles=[
             f"CI width — NCDE 2σ (grey) vs conformal {int(float(alpha)*100)}% (colour)",
-            f"q̂ per ETF  (red line = 1.0, perfectly calibrated)",
+            q_panel_title,
         ],
         horizontal_spacing=0.14,
     )
@@ -593,7 +621,7 @@ def render_interval_comparison_chart(conf_sig: dict, ncde_sig: dict,
         hovertemplate="<b>%{y}</b><br>q̂ = %{x:.3f}<extra></extra>",
     ), row=1, col=2)
 
-    fig.add_vline(x=1.0, line_width=1.5, line_dash="dash",
+    fig.add_vline(x=q_ref_line, line_width=1.5, line_dash="dash",
                   line_color="#ef4444", row=1, col=2)
 
     fig.update_layout(
@@ -608,7 +636,7 @@ def render_interval_comparison_chart(conf_sig: dict, ncde_sig: dict,
     )
     fig.update_xaxes(showgrid=True, gridcolor="#f3f4f6", row=1, col=1)
     fig.update_xaxes(showgrid=True, gridcolor="#f3f4f6",
-                     title_text="q̂", row=1, col=2)
+                     title_text=q_axis_label, row=1, col=2)
     fig.update_yaxes(showgrid=False)
 
     st.plotly_chart(fig, use_container_width=True,
@@ -622,33 +650,54 @@ def render_q_hat_table(conf_sig: dict, option: str):
     if not tickers:
         return
 
-    conf_fc = conf_sig.get("conformal_forecasts", {})
+    conf_fc    = conf_sig.get("conformal_forecasts", {})
+    score_type = conf_sig.get("score_type", "normalised")
+
+    # Column label and caption change depending on score type
+    if score_type == "absolute":
+        q_col_suffix = "% ret"
+        caption = (
+            "q̂ is the **interval half-width in return units** (e.g. 0.015 = ±1.5%). "
+            "All ETFs share the same q̂ at each level — width is constant, not σ-scaled. "
+            "CI = [μ − q̂,  μ + q̂]."
+        )
+    else:
+        q_col_suffix = "σ-units"
+        caption = (
+            "q̂ > 1 → NCDE σ was **too tight** on this ETF (intervals inflated). "
+            "q̂ < 1 → NCDE was over-cautious (intervals shrunk slightly). "
+            "CI = [μ − q̂·σ,  μ + q̂·σ]."
+        )
+
     rows = []
     for t in tickers:
         fc_t = conf_fc.get(t, {})
         q    = fc_t.get("q_hat",     {})
         ivs  = fc_t.get("intervals", {})
+
+        # For absolute mode, show q̂ as percentage for readability
+        def fmt_q(v):
+            if score_type == "absolute":
+                return round(v * 100, 4)   # express as % return
+            return round(v, 4)
+
         rows.append({
-            "ETF":            t,
-            "μ":              round(fc_t.get("mu",    0), 5),
-            "σ (NCDE)":       round(fc_t.get("sigma", 0), 5),
-            "q̂ 90%":         round(q.get("0.9", 0),  3),
-            "q̂ 80%":         round(q.get("0.8", 0),  3),
-            "q̂ 70%":         round(q.get("0.7", 0),  3),
-            "CI 90% lo":      round(ivs.get("0.9", {}).get("lo",    0), 5),
-            "CI 90% hi":      round(ivs.get("0.9", {}).get("hi",    0), 5),
-            "CI 90% width":   round(ivs.get("0.9", {}).get("width", 0), 5),
+            "ETF":                  t,
+            "μ":                    round(fc_t.get("mu",    0), 5),
+            "σ (NCDE)":             round(fc_t.get("sigma", 0), 5),
+            f"q̂ 90% ({q_col_suffix})": fmt_q(q.get("0.9", 0)),
+            f"q̂ 80% ({q_col_suffix})": fmt_q(q.get("0.8", 0)),
+            f"q̂ 70% ({q_col_suffix})": fmt_q(q.get("0.7", 0)),
+            "CI 90% lo":            round(ivs.get("0.9", {}).get("lo",    0), 5),
+            "CI 90% hi":            round(ivs.get("0.9", {}).get("hi",    0), 5),
+            "CI 90% width":         round(ivs.get("0.9", {}).get("width", 0), 5),
         })
 
     if not rows:
         return
 
     df = pd.DataFrame(rows).sort_values("μ", ascending=False)
-    st.caption(
-        "q̂ > 1 → NCDE σ was **too tight** on this ETF (intervals inflated). "
-        "q̂ < 1 → NCDE was over-cautious (intervals shrunk slightly). "
-        "🟠 q̂ > 1.5 = significant NCDE overconfidence on this asset."
-    )
+    st.caption(caption)
     st.dataframe(df, use_container_width=True, hide_index=True)
 
 
@@ -783,11 +832,19 @@ def render_conformal_option(option: str, ncde_signals: dict,
         '</div>',
         unsafe_allow_html=True,
     )
-    st.caption(
-        "Left: how much wider the conformal interval is vs raw NCDE ±σ. "
-        "Right: q̂ — the inflation factor per ETF. "
-        "Red line = 1.0 (perfectly calibrated). Orange = q̂ > 1.5 (NCDE was overconfident here)."
-    )
+    if score_type == "absolute":
+        width_caption = (
+            "Left: conformal CI width (coloured) vs raw NCDE 2σ (grey). "
+            "In **absolute** mode all ETFs share the same q̂ so widths differ only by 2×q̂ vs 2σ. "
+            "Right: q̂ in return units — the actual half-width of each interval."
+        )
+    else:
+        width_caption = (
+            "Left: how much wider the conformal interval is vs raw NCDE ±σ. "
+            "Right: q̂ — the inflation factor per ETF. "
+            "Red line = 1.0 (perfectly calibrated). Orange = q̂ > 1.5 (NCDE was overconfident here)."
+        )
+    st.caption(width_caption)
     render_interval_comparison_chart(conf_sig, ncde_sig, alpha_choice, option)
 
     # ── 3. Full q̂ table ───────────────────────────────────────────────────────
