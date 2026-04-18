@@ -1,13 +1,7 @@
 # app.py — P2-ETF-NCDE-ENGINE Streamlit Dashboard
 #
-# SIMPLIFIED: Now reads from separate signal_A.json and signal_B.json files
-# Removed dependency on combined latest_signals.json
-#
-# Tabs:
-#   📊 Option A — Fixed Income / Alts
-#   📈 Option B — Equity Sectors
-#   ∂̂  Conformal — FI / Commodities
-#   ∂̂  Conformal — Equities
+# SIMPLIFIED: Now reads from separate signal files
+# Conformal files: conformal_optionA.json and conformal_optionB.json
 
 import json
 from datetime import datetime
@@ -79,11 +73,11 @@ def load_signal(option: str) -> dict:
 
 @st.cache_data(ttl=300)
 def load_conformal_signal(option: str) -> dict:
-    """Load conformal signal for a single option."""
+    """Load conformal signal - uses conformal_optionA.json / conformal_optionB.json format."""
     try:
         path = hf_hub_download(
             repo_id=cfg.HF_SIGNALS_REPO,
-            filename=f"conformal/signal_{option}_conformal.json",
+            filename=f"conformal/conformal_option{option}.json",
             repo_type="dataset",
             token=cfg.HF_TOKEN or None,
             force_download=True,
