@@ -7,6 +7,7 @@
 # - load_model() now reads enriched_h0 from metadata and passes to model constructor
 # - Removed manual vector_field_dim addition (already in metadata from train.py)
 # - Added proper enriched_h0 handling for state dict compatibility
+# - FIX: Now uses metadata tickers to ensure consistency with training
 #
 # Output schema per option:
 # signal_date, last_data_date, generated_at,
@@ -124,6 +125,7 @@ def load_model(option: str) -> tuple:
     model.eval()
 
     print(f"[predict] Model loaded: {sum(p.numel() for p in model.parameters()):,} parameters")
+    print(f"[predict] Model expects {meta['n_assets']} assets: {meta['tickers']}")
 
     return model, meta, scaler
 
@@ -131,25 +133,46 @@ def load_model(option: str) -> tuple:
 
 def _build_inference_tensors(option: str, master: pd.DataFrame, meta: dict) -> tuple:
     """Build scaled (1, T, F) arrays ready for spline construction."""
-    data = loader.get_option_data(option, master)
-    lookback = meta["config"]["lookback"]
+    # FIX: Use the exact tickers from training metadata, not from config
+    # This ensures consistency even if some tickers were missing from data
     tickers = meta["tickers"]
+    lookback = meta["config"]["lookback"]
+    
+    # Get data for all configured tickers for this option
+    data = loader.get_option_data(option, master)
+    
+    # FIX: Override data["tickers"] with metadata tickers to ensure consistency
+    data["tickers"] = tickers
 
-    asset_feat = feat.build_asset_features(data["log_returns"], data["vol"])
+    # FIX: Pass tickers to build_asset_features to ensure all get columns
+    asset_feat = feat.build_asset_features(data["log_returns"], data["vol"], tickers=tickers)
     macro_feat = feat.build_macro_features(data["macro"], data["macro_derived"])
 
     common_idx = asset_feat.index.intersection(macro_feat.index)
     af = asset_feat.reindex(common_idx).ffill().fillna(0.0)
     mf = macro_feat.reindex(common_idx).ffill().fillna(0.0)
 
-    # Build per-asset column indices
+    # Build per-asset column indices using metadata tickers
     n_assets = len(tickers)
     asset_col_indices = []
+    
     for ticker in tickers:
         cols = [c for c in af.columns if c.startswith(ticker + "_")]
+        if len(cols) == 0:
+            # This should not happen with the fix to build_asset_features
+            raise ValueError(f"No features found for ticker {ticker} - model expects it but features not found!")
         idxs = [af.columns.get_loc(c) for c in cols]
         asset_col_indices.append(idxs)
-    n_asset_feats = len(asset_col_indices[0])
+
+    # Check that all tickers have the same number of features
+    n_asset_feats_per_ticker = [len(idxs) for idxs in asset_col_indices]
+    if len(set(n_asset_feats_per_ticker)) > 1:
+        print(f"[predict] Warning: Tickers have different numbers of features: {dict(zip(tickers, n_asset_feats_per_ticker))}")
+        min_feats = min(n_asset_feats_per_ticker)
+        asset_col_indices = [idxs[:min_feats] for idxs in asset_col_indices]
+        n_asset_feats = min_feats
+    else:
+        n_asset_feats = n_asset_feats_per_ticker[0]
 
     af_window = af.iloc[-lookback:].values
     mf_window = mf.iloc[-lookback:].values
@@ -199,7 +222,7 @@ def generate_signal(option: str, master: pd.DataFrame) -> dict:
     raw_conf = 1.0 / (sigma_arr + 1e-8)
     confidence = raw_conf / raw_conf.sum()
 
-    # Per-ETF forecast dict
+    # Per-ETF forecast dict - use tickers from metadata
     forecasts = {
         tickers[i]: {
             "mu": round(float(mu_arr[i]), 6),
