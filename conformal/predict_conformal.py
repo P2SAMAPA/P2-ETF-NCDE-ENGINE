@@ -15,6 +15,9 @@
 #
 # Self-healing: auto-calibrates (absolute mode) if params missing.
 #
+# SIMPLIFIED: Now saves only two separate files (conformal_optionA.json and 
+# conformal_optionB.json) plus history files. Removed combined latest_signals_conformal.json.
+#
 # Usage:
 #   python -m conformal.predict_conformal --option both
 
@@ -31,8 +34,9 @@ import config as cfg
 
 # ── Loaders ───────────────────────────────────────────────────────────────────
 
-def load_ncde_signals() -> dict:
-    local = os.path.join(cfg.MODELS_DIR, "latest_signals.json")
+def load_ncde_signal(option: str) -> dict:
+    """Load NCDE signal for a single option from separate file."""
+    local = os.path.join(cfg.MODELS_DIR, f"signal_{option}.json")
     if os.path.exists(local):
         with open(local) as f:
             return json.load(f)
@@ -40,7 +44,7 @@ def load_ncde_signals() -> dict:
         from huggingface_hub import hf_hub_download
         path = hf_hub_download(
             repo_id=cfg.HF_SIGNALS_REPO,
-            filename="signals/latest_signals.json",
+            filename=f"signals/signal_{option}.json",
             repo_type="dataset",
             token=cfg.HF_TOKEN or None,
             local_dir=cfg.MODELS_DIR,
@@ -49,7 +53,7 @@ def load_ncde_signals() -> dict:
             return json.load(f)
     except Exception as e:
         raise FileNotFoundError(
-            f"Could not find latest_signals.json locally or on HF: {e}"
+            f"Could not find signal_{option}.json locally or on HF: {e}"
         )
 
 
@@ -208,18 +212,16 @@ def wrap_signal(ncde_signal: dict, conformal_params: dict) -> dict:
 
 # ── Save + upload ─────────────────────────────────────────────────────────────
 
-def save_and_upload(sig_A=None, sig_B=None):
+def save_conformal_signal(signal: dict, option: str):
+    """Save a single conformal signal to HF dataset repo."""
     os.makedirs(cfg.MODELS_DIR, exist_ok=True)
-
-    combined = {
-        "generated_at": datetime.utcnow().isoformat(),
-        "option_A":     sig_A or None,
-        "option_B":     sig_B or None,
-    }
-
-    local_path = os.path.join(cfg.MODELS_DIR, "latest_signals_conformal.json")
+    
+    filename = f"conformal_option{option}.json"
+    local_path = os.path.join(cfg.MODELS_DIR, filename)
+    
     with open(local_path, "w") as f:
-        json.dump(combined, f, indent=2)
+        json.dump(signal, f, indent=2)
+    
     print(f"[predict_conformal] Saved locally → {local_path}")
 
     if not cfg.HF_TOKEN:
@@ -232,18 +234,17 @@ def save_and_upload(sig_A=None, sig_B=None):
         with open(local_path, "rb") as f:
             api.upload_file(
                 path_or_fileobj=f,
-                path_in_repo="conformal/latest_signals_conformal.json",
+                path_in_repo=f"conformal/{filename}",
                 repo_id=cfg.HF_SIGNALS_REPO,
                 repo_type="dataset",
-                commit_message=f"Update conformal signals ({combined['generated_at']})",
+                commit_message=f"Update conformal signal Option {option} ({signal['signal_date']})",
             )
-        print(f"[predict_conformal] Uploaded → {cfg.HF_SIGNALS_REPO}")
+        print(f"[predict_conformal] Uploaded {filename} → {cfg.HF_SIGNALS_REPO}")
     except Exception as e:
         print(f"[predict_conformal] WARNING: upload failed: {e}")
 
-    for sig, opt in [(sig_A, "A"), (sig_B, "B")]:
-        if sig:
-            _update_conformal_history(sig, opt)
+    # Update history
+    _update_conformal_history(signal, option)
 
 
 def _update_conformal_history(sig: dict, option: str):
@@ -326,12 +327,16 @@ def _update_conformal_history(sig: dict, option: str):
 
 # ── Per-option runner ─────────────────────────────────────────────────────────
 
-def run_option(option: str, ncde_raw: dict) -> dict | None:
-    key      = f"option_{option}"
-    ncde_sig = ncde_raw.get(key)
+def run_option(option: str) -> dict | None:
+    """Run conformal prediction for a single option."""
+    try:
+        ncde_sig = load_ncde_signal(option)
+    except FileNotFoundError as e:
+        print(f"[predict_conformal] NCDE Option {option} signal not found — skipping: {e}")
+        return None
 
-    if not ncde_sig or not isinstance(ncde_sig, dict) or "top_pick" not in ncde_sig:
-        print(f"[predict_conformal] NCDE Option {option} signal absent — skipping.")
+    if not isinstance(ncde_sig, dict) or "top_pick" not in ncde_sig:
+        print(f"[predict_conformal] NCDE Option {option} signal invalid — skipping.")
         return None
 
     try:
@@ -367,16 +372,12 @@ if __name__ == "__main__":
     parser.add_argument("--option", choices=["A", "B", "both"], default="both")
     args = parser.parse_args()
 
-    print("[predict_conformal] Loading NCDE signals...")
-    ncde_raw = load_ncde_signals()
-
     options = ["A", "B"] if args.option == "both" else [args.option]
-    sig_A = sig_B = None
 
-    if "A" in options:
-        sig_A = run_option("A", ncde_raw)
-    if "B" in options:
-        sig_B = run_option("B", ncde_raw)
+    for opt in options:
+        print(f"[predict_conformal] Processing Option {opt}...")
+        signal = run_option(opt)
+        if signal:
+            save_conformal_signal(signal, opt)
 
-    save_and_upload(sig_A, sig_B)
     print("[predict_conformal] Done.")
