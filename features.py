@@ -1,18 +1,18 @@
 # features.py — Feature engineering and continuous path builder for NCDE
 #
 # Key difference from DeePM features.py:
-#   build_ncde_path() produces a torchcde-compatible cubic spline interpolation
-#   of the multivariate time series, which is what the NCDE solver consumes.
+# build_ncde_path() produces a torchcde-compatible cubic spline interpolation
+# of the multivariate time series, which is what the NCDE solver consumes.
 #
 # Input feature set per asset per day:
-#   - Log returns: 1d, 5d, 21d, 63d
-#   - Realised vol (21d annualised)
-#   - Vol-scaled return (Sharpe-like signal)
-#   - Cross-sectional momentum z-rank
+# - Log returns: 1d, 5d, 21d, 63d
+# - Realised vol (21d annualised)
+# - Vol-scaled return (Sharpe-like signal)
+# - Cross-sectional momentum z-rank
 #
 # Control path (macro, shared across assets):
-#   - Derived macro features from macro_derived
-#   - These feed in as dX(t) — the "control" in the controlled DE
+# - Derived macro features from macro_derived
+# - These feed in as dX(t) — the "control" in the controlled DE
 
 import numpy as np
 import pandas as pd
@@ -20,7 +20,6 @@ import torch
 import torchcde
 from sklearn.preprocessing import RobustScaler
 import config as cfg
-
 
 # ── Per-asset time-series features ────────────────────────────────────────────
 
@@ -32,22 +31,22 @@ def build_asset_features(log_returns: pd.DataFrame, vol: pd.DataFrame) -> pd.Dat
     frames = []
     for ticker in log_returns.columns:
         lr = log_returns[ticker]
-        v  = vol[ticker] if ticker in vol.columns else \
-             lr.rolling(cfg.VOL_WINDOW).std() * np.sqrt(252)
+        v = vol[ticker] if ticker in vol.columns else \
+            lr.rolling(cfg.VOL_WINDOW).std() * np.sqrt(252)
 
         f = pd.DataFrame(index=lr.index)
-        f[f"{ticker}_logret_1d"]  = lr
-        f[f"{ticker}_logret_5d"]  = lr.rolling(5).sum()
+        f[f"{ticker}_logret_1d"] = lr
+        f[f"{ticker}_logret_5d"] = lr.rolling(5).sum()
         f[f"{ticker}_logret_21d"] = lr.rolling(21).sum()
         f[f"{ticker}_logret_63d"] = lr.rolling(63).sum()
-        f[f"{ticker}_vol"]        = v
+        f[f"{ticker}_vol"] = v
         f[f"{ticker}_vol_scaled"] = lr / (v.replace(0, np.nan) / np.sqrt(252) + 1e-8)
         frames.append(f)
 
     asset_features = pd.concat(frames, axis=1)
 
     # Cross-sectional momentum z-rank ([-1, 1])
-    ret_1d_cols  = [c for c in asset_features.columns if c.endswith("_logret_1d")]
+    ret_1d_cols = [c for c in asset_features.columns if c.endswith("_logret_1d")]
     ret_21d_cols = [c for c in asset_features.columns if c.endswith("_logret_21d")]
 
     for cols, suffix in [(ret_1d_cols, "mom1d_zrank"), (ret_21d_cols, "mom21d_zrank")]:
@@ -57,7 +56,6 @@ def build_asset_features(log_returns: pd.DataFrame, vol: pd.DataFrame) -> pd.Dat
             asset_features[f"{ticker}_{suffix}"] = rank_df[orig_col]
 
     return asset_features.dropna(how="all")
-
 
 def build_macro_features(macro: pd.DataFrame, macro_derived: pd.DataFrame) -> pd.DataFrame:
     """
@@ -80,7 +78,6 @@ def build_macro_features(macro: pd.DataFrame, macro_derived: pd.DataFrame) -> pd
     macro_feat = macro_derived[derived_cols].copy()
     macro_feat.index.name = "Date"
     return macro_feat
-
 
 # ── Continuous path builder (core NCDE ingredient) ────────────────────────────
 
@@ -105,27 +102,26 @@ def build_ncde_path(
     coeffs = torchcde.natural_cubic_coeffs(X_t, t)
     return torchcde.CubicSpline(coeffs, t)
 
-
 # ── Sequence builder ───────────────────────────────────────────────────────────
 
 def build_sequences(
-    asset_features:  pd.DataFrame,
-    macro_features:  pd.DataFrame,
-    tickers:         list,
-    lookback:        int,
-    target_returns:  pd.DataFrame,
+    asset_features: pd.DataFrame,
+    macro_features: pd.DataFrame,
+    tickers: list,
+    lookback: int,
+    target_returns: pd.DataFrame,
 ) -> tuple:
     """
     Build sliding-window sequences for NCDE training.
 
     Returns:
-        X_asset  : np.ndarray (N, lookback, n_asset_feats * n_assets)
-                   All asset features concatenated along feature dim.
-                   The NCDE sees the full multivariate path jointly.
-        X_macro  : np.ndarray (N, lookback, n_macro_feats)
-                   Control path — macro series interpolated separately.
-        y        : np.ndarray (N, n_assets) — next-day simple returns
-        dates    : DatetimeIndex of prediction dates (length N)
+        X_asset : np.ndarray (N, lookback, n_asset_feats * n_assets)
+            All asset features concatenated along feature dim.
+            The NCDE sees the full multivariate path jointly.
+        X_macro : np.ndarray (N, lookback, n_macro_feats)
+            Control path — macro series interpolated separately.
+        y : np.ndarray (N, n_assets) — next-day simple returns
+        dates : DatetimeIndex of prediction dates (length N)
     """
     common_idx = (
         asset_features.index
@@ -137,23 +133,47 @@ def build_sequences(
     mf = macro_features.reindex(common_idx).ffill().fillna(0.0)
     tr = target_returns.reindex(common_idx)
 
-    # Build per-asset column index map
+    # Build per-asset column index map - only include tickers that have features
     asset_col_indices = []
+    valid_tickers = []
+
     for ticker in tickers:
         cols = [c for c in af.columns if c.startswith(ticker + "_")]
+        if len(cols) == 0:
+            print(f"[features] Warning: No features found for ticker {ticker}, skipping...")
+            continue
         idxs = [af.columns.get_loc(c) for c in cols]
         asset_col_indices.append(idxs)
+        valid_tickers.append(ticker)
 
-    n_assets      = len(tickers)
-    n_asset_feats = len(asset_col_indices[0])
+    if len(valid_tickers) == 0:
+        raise ValueError(f"No valid tickers found with features. Requested tickers: {tickers}")
+
+    # Update tickers list to only include valid ones
+    tickers = valid_tickers
+    n_assets = len(tickers)
+
+    # Check that all tickers have the same number of features
+    n_asset_feats_per_ticker = [len(idxs) for idxs in asset_col_indices]
+    if len(set(n_asset_feats_per_ticker)) > 1:
+        print(f"[features] Warning: Tickers have different numbers of features: {dict(zip(tickers, n_asset_feats_per_ticker))}")
+        # Use the minimum to ensure consistency, or raise an error
+        min_feats = min(n_asset_feats_per_ticker)
+        print(f"[features] Using minimum feature count: {min_feats}")
+        # Truncate all to the minimum
+        asset_col_indices = [idxs[:min_feats] for idxs in asset_col_indices]
+        n_asset_feats = min_feats
+    else:
+        n_asset_feats = n_asset_feats_per_ticker[0]
+
     n_macro_feats = mf.shape[1]
-    N             = len(common_idx) - lookback
+    N = len(common_idx) - lookback
 
     # Concatenate all asset features into one path vector per timestep
     # Shape: (N, lookback, n_assets * n_asset_feats)
     X_asset = np.zeros((N, lookback, n_assets * n_asset_feats), dtype=np.float32)
-    X_macro = np.zeros((N, lookback, n_macro_feats),            dtype=np.float32)
-    y       = np.zeros((N, n_assets),                           dtype=np.float32)
+    X_macro = np.zeros((N, lookback, n_macro_feats), dtype=np.float32)
+    y = np.zeros((N, n_assets), dtype=np.float32)
 
     af_arr = af.values
     mf_arr = mf.values
@@ -163,15 +183,16 @@ def build_sequences(
         window = slice(i, i + lookback)
         for a, col_idxs in enumerate(asset_col_indices):
             start = a * n_asset_feats
-            X_asset[i, :, start:start + n_asset_feats] = af_arr[window][:, col_idxs]
+            # Ensure we don't try to assign empty arrays
+            if len(col_idxs) > 0:
+                X_asset[i, :, start:start + n_asset_feats] = af_arr[window][:, col_idxs]
         X_macro[i] = mf_arr[window]
-        y[i]       = tr_arr[i + lookback]
+        y[i] = tr_arr[i + lookback]
 
     y = np.nan_to_num(y, nan=0.0)
     dates = common_idx[lookback:]
 
-    return X_asset, X_macro, y, dates
-
+    return X_asset, X_macro, y, dates, tickers  # Return updated tickers list
 
 # ── Scaler ─────────────────────────────────────────────────────────────────────
 
@@ -185,8 +206,8 @@ class PathScaler:
     def __init__(self):
         self.asset_scaler = RobustScaler()
         self.macro_scaler = RobustScaler()
-        self._fitted      = False
-        self._has_macro   = None
+        self._fitted = False
+        self._has_macro = None
 
     def fit(self, X_asset: np.ndarray, X_macro: np.ndarray):
         N, T, Fa = X_asset.shape
@@ -217,7 +238,6 @@ class PathScaler:
     def fit_transform(self, X_asset: np.ndarray, X_macro: np.ndarray):
         return self.fit(X_asset, X_macro).transform(X_asset, X_macro)
 
-
 # ── Full pipeline ──────────────────────────────────────────────────────────────
 
 def prepare_features(data: dict, lookback: int = None) -> dict:
@@ -225,7 +245,7 @@ def prepare_features(data: dict, lookback: int = None) -> dict:
     Full feature preparation pipeline for one option (A or B).
 
     Args:
-        data     : dict from loader.get_option_data()
+        data : dict from loader.get_option_data()
         lookback : sequence length (default cfg.LOOKBACK)
 
     Returns dict with:
@@ -242,20 +262,22 @@ def prepare_features(data: dict, lookback: int = None) -> dict:
         data["returns"].index.intersection(asset_feat.index)
     )
 
-    X_asset, X_macro, y, dates = build_sequences(
+    # Pass data["tickers"] but be prepared for it to be filtered
+    X_asset, X_macro, y, dates, valid_tickers = build_sequences(
         asset_feat, macro_feat, data["tickers"], lookback, target_ret
     )
 
     print(f"[features] X_asset: {X_asset.shape}, X_macro: {X_macro.shape}, y: {y.shape}")
+    print(f"[features] Valid tickers ({len(valid_tickers)}): {valid_tickers}")
 
     return {
-        "X_asset":          X_asset,
-        "X_macro":          X_macro,
-        "y":                y,
-        "dates":            dates,
-        "tickers":          data["tickers"],
-        "n_assets":         len(data["tickers"]),
-        "n_asset_path_dim": X_asset.shape[-1],   # n_assets * n_asset_feats_per_ticker
-        "n_macro_feats":    X_macro.shape[-1],
+        "X_asset": X_asset,
+        "X_macro": X_macro,
+        "y": y,
+        "dates": dates,
+        "tickers": valid_tickers,  # Return the filtered list
+        "n_assets": len(valid_tickers),
+        "n_asset_path_dim": X_asset.shape[-1],  # n_assets * n_asset_feats_per_ticker
+        "n_macro_feats": X_macro.shape[-1],
         "macro_feat_names": list(macro_feat.columns),
     }
