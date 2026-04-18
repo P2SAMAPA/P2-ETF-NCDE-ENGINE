@@ -23,17 +23,30 @@ import config as cfg
 
 # ── Per-asset time-series features ────────────────────────────────────────────
 
-def build_asset_features(log_returns: pd.DataFrame, vol: pd.DataFrame) -> pd.DataFrame:
+def build_asset_features(log_returns: pd.DataFrame, vol: pd.DataFrame, tickers: list = None) -> pd.DataFrame:
     """
     Build per-asset features concatenated into a flat DataFrame.
     Columns: {TICKER}_logret_1d, {TICKER}_logret_5d, ..., {TICKER}_vol, {TICKER}_mom_zrank
+    
+    FIX: Now ensures ALL tickers from config get feature columns, even if missing from data.
+    Missing tickers are filled with zeros (neutral values).
     """
+    # Get expected tickers from config if not provided
+    if tickers is None:
+        tickers = list(log_returns.columns)
+    
     frames = []
-    for ticker in log_returns.columns:
-        lr = log_returns[ticker]
-        v = vol[ticker] if ticker in vol.columns else \
-            lr.rolling(cfg.VOL_WINDOW).std() * np.sqrt(252)
-
+    for ticker in tickers:
+        if ticker in log_returns.columns:
+            lr = log_returns[ticker]
+            v = vol[ticker] if ticker in vol.columns else \
+                lr.rolling(cfg.VOL_WINDOW).std() * np.sqrt(252)
+        else:
+            # Ticker missing from data - create zero-filled series
+            print(f"[features] Warning: Ticker {ticker} not found in data, creating zero-filled features")
+            lr = pd.Series(0.0, index=log_returns.index, name=ticker)
+            v = pd.Series(0.0, index=log_returns.index, name=ticker)
+        
         f = pd.DataFrame(index=lr.index)
         f[f"{ticker}_logret_1d"] = lr
         f[f"{ticker}_logret_5d"] = lr.rolling(5).sum()
@@ -46,11 +59,13 @@ def build_asset_features(log_returns: pd.DataFrame, vol: pd.DataFrame) -> pd.Dat
     asset_features = pd.concat(frames, axis=1)
 
     # Cross-sectional momentum z-rank ([-1, 1])
+    # For missing tickers, they will have rank 0 (middle/neutral)
     ret_1d_cols = [c for c in asset_features.columns if c.endswith("_logret_1d")]
     ret_21d_cols = [c for c in asset_features.columns if c.endswith("_logret_21d")]
 
     for cols, suffix in [(ret_1d_cols, "mom1d_zrank"), (ret_21d_cols, "mom21d_zrank")]:
-        rank_df = asset_features[cols].rank(axis=1, pct=True) * 2 - 1
+        # Fill NaN with 0 before ranking so missing tickers get neutral rank
+        rank_df = asset_features[cols].fillna(0).rank(axis=1, pct=True) * 2 - 1
         for orig_col in cols:
             ticker = orig_col.split("_")[0]
             asset_features[f"{ticker}_{suffix}"] = rank_df[orig_col]
@@ -114,6 +129,9 @@ def build_sequences(
     """
     Build sliding-window sequences for NCDE training.
 
+    FIX: No longer filters out tickers - assumes all tickers have feature columns.
+    This ensures model trains on all configured ETFs even if some have missing data.
+    
     Returns:
         X_asset : np.ndarray (N, lookback, n_asset_feats * n_assets)
             All asset features concatenated along feature dim.
@@ -133,31 +151,30 @@ def build_sequences(
     mf = macro_features.reindex(common_idx).ffill().fillna(0.0)
     tr = target_returns.reindex(common_idx)
 
-    # Build per-asset column index map - only include tickers that have features
+    # Build per-asset column indices - ALL tickers must have features now
     asset_col_indices = []
-    valid_tickers = []
+    missing_tickers = []
 
     for ticker in tickers:
         cols = [c for c in af.columns if c.startswith(ticker + "_")]
         if len(cols) == 0:
-            print(f"[features] Warning: No features found for ticker {ticker}, skipping...")
+            # This should not happen with the fix to build_asset_features
+            print(f"[features] ERROR: No features found for ticker {ticker} - this should not happen!")
+            missing_tickers.append(ticker)
             continue
         idxs = [af.columns.get_loc(c) for c in cols]
         asset_col_indices.append(idxs)
-        valid_tickers.append(ticker)
 
-    if len(valid_tickers) == 0:
-        raise ValueError(f"No valid tickers found with features. Requested tickers: {tickers}")
+    if missing_tickers:
+        raise ValueError(f"Tickers missing features: {missing_tickers}. Check build_asset_features.")
 
-    # Update tickers list to only include valid ones
-    tickers = valid_tickers
     n_assets = len(tickers)
 
     # Check that all tickers have the same number of features
     n_asset_feats_per_ticker = [len(idxs) for idxs in asset_col_indices]
     if len(set(n_asset_feats_per_ticker)) > 1:
         print(f"[features] Warning: Tickers have different numbers of features: {dict(zip(tickers, n_asset_feats_per_ticker))}")
-        # Use the minimum to ensure consistency, or raise an error
+        # Use the minimum to ensure consistency
         min_feats = min(n_asset_feats_per_ticker)
         print(f"[features] Using minimum feature count: {min_feats}")
         # Truncate all to the minimum
@@ -192,7 +209,7 @@ def build_sequences(
     y = np.nan_to_num(y, nan=0.0)
     dates = common_idx[lookback:]
 
-    return X_asset, X_macro, y, dates, tickers  # Return updated tickers list
+    return X_asset, X_macro, y, dates, tickers  # Return original tickers list (not filtered)
 
 # ── Scaler ─────────────────────────────────────────────────────────────────────
 
@@ -255,28 +272,29 @@ def prepare_features(data: dict, lookback: int = None) -> dict:
     lookback = lookback or cfg.LOOKBACK
     print(f"[features] Building features for Option {data['option']}...")
 
-    asset_feat = build_asset_features(data["log_returns"], data["vol"])
+    # FIX: Pass the expected tickers list to ensure all get feature columns
+    asset_feat = build_asset_features(data["log_returns"], data["vol"], tickers=data["tickers"])
     macro_feat = build_macro_features(data["macro"], data["macro_derived"])
 
     target_ret = data["returns"].reindex(
         data["returns"].index.intersection(asset_feat.index)
     )
 
-    # Pass data["tickers"] but be prepared for it to be filtered
-    X_asset, X_macro, y, dates, valid_tickers = build_sequences(
+    # All tickers should now have features
+    X_asset, X_macro, y, dates, final_tickers = build_sequences(
         asset_feat, macro_feat, data["tickers"], lookback, target_ret
     )
 
     print(f"[features] X_asset: {X_asset.shape}, X_macro: {X_macro.shape}, y: {y.shape}")
-    print(f"[features] Valid tickers ({len(valid_tickers)}): {valid_tickers}")
+    print(f"[features] Tickers ({len(final_tickers)}): {final_tickers}")
 
     return {
         "X_asset": X_asset,
         "X_macro": X_macro,
         "y": y,
         "dates": dates,
-        "tickers": valid_tickers,  # Return the filtered list
-        "n_assets": len(valid_tickers),
+        "tickers": final_tickers,  # Should match data["tickers"]
+        "n_assets": len(final_tickers),
         "n_asset_path_dim": X_asset.shape[-1],  # n_assets * n_asset_feats_per_ticker
         "n_macro_feats": X_macro.shape[-1],
         "macro_feat_names": list(macro_feat.columns),
