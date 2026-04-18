@@ -8,6 +8,7 @@
 # - Now passes enriched_h0=True to NCDEForecaster constructor
 # - Removed redundant re-application of fix5 after model.load_state_dict
 # - Simplified code, eliminated architecture mismatch
+# - FIX: Passes tickers list to build_asset_features to ensure all ETFs get features
 #
 # Usage:
 # python train.py --option A
@@ -209,6 +210,7 @@ def train_option(option: str) -> dict:
 
     # Feature engineering
     print("\n[2/5] Building features...")
+    # FIX: Ensure all tickers from config get feature columns
     feat_dict = feat.prepare_features(data, lookback=lookback)
     scaler = feat.PathScaler()
 
