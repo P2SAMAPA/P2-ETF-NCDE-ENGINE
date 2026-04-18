@@ -1,13 +1,7 @@
 # predict.py — Daily signal generation for P2-ETF-NCDE-ENGINE
 #
-# CORRECTED VERSION: Now properly handles enriched_h0 parameter from metadata.
-# This ensures compatibility with models trained with Fix 5 (enriched initial state).
-#
-# Changes:
-# - load_model() now reads enriched_h0 from metadata and passes to model constructor
-# - Removed manual vector_field_dim addition (already in metadata from train.py)
-# - Added proper enriched_h0 handling for state dict compatibility
-# - FIX: Now uses metadata tickers to ensure consistency with training
+# SIMPLIFIED: Now saves only two separate files (signal_A.json and signal_B.json)
+# Removed combined latest_signals.json to simplify the flow
 #
 # Output schema per option:
 # signal_date, last_data_date, generated_at,
@@ -90,19 +84,12 @@ def load_model(option: str) -> tuple:
     with open(scaler_path, "rb") as f:
         scaler = pickle.load(f)
 
-    # CORRECTED: Read enriched_h0 from metadata (Fix 5 flag)
-    # Default to False for backward compatibility with old models
     enriched_h0 = meta.get("config", {}).get("enriched_h0", False)
     if enriched_h0 is None:
         enriched_h0 = meta.get("config", {}).get("fix5_h0_enriched", False)
 
-    # Also support old metadata format
-    if not enriched_h0:
-        enriched_h0 = meta.get("config", {}).get("fix5_h0_enriched", False)
-
     print(f"[predict] Loading model for Option {option} (enriched_h0={enriched_h0})")
 
-    # CORRECTED: Build model with all parameters from metadata, including enriched_h0
     model = NCDEForecaster(
         n_asset_path_dim=meta["n_asset_path_dim"],
         n_macro_feats=meta["n_macro_feats"],
@@ -111,15 +98,14 @@ def load_model(option: str) -> tuple:
         vector_field_dim=meta["config"]["vector_field_dim"],
         n_layers=meta["config"]["n_layers"],
         readout_dim=meta["config"]["readout_dim"],
-        dropout=0.0,  # no dropout at inference
+        dropout=0.0,
         solver=meta["config"].get("solver", cfg.SOLVER),
         adjoint=meta["config"].get("adjoint", cfg.ADJOINT),
         ode_steps=meta["config"]["ode_steps"],
         lookback=meta["config"]["lookback"],
-        enriched_h0=enriched_h0,  # ← CORRECTED: Pass enriched_h0 from metadata
+        enriched_h0=enriched_h0,
     ).to(DEVICE)
 
-    # Load weights
     state_dict = torch.load(model_path, map_location=DEVICE)
     model.load_state_dict(state_dict)
     model.eval()
@@ -133,18 +119,12 @@ def load_model(option: str) -> tuple:
 
 def _build_inference_tensors(option: str, master: pd.DataFrame, meta: dict) -> tuple:
     """Build scaled (1, T, F) arrays ready for spline construction."""
-    # FIX: Use the exact tickers from training metadata, not from config
-    # This ensures consistency even if some tickers were missing from data
     tickers = meta["tickers"]
     lookback = meta["config"]["lookback"]
     
-    # Get data for all configured tickers for this option
     data = loader.get_option_data(option, master)
-    
-    # FIX: Override data["tickers"] with metadata tickers to ensure consistency
     data["tickers"] = tickers
 
-    # FIX: Pass tickers to build_asset_features to ensure all get columns
     asset_feat = feat.build_asset_features(data["log_returns"], data["vol"], tickers=tickers)
     macro_feat = feat.build_macro_features(data["macro"], data["macro_derived"])
 
@@ -152,22 +132,19 @@ def _build_inference_tensors(option: str, master: pd.DataFrame, meta: dict) -> t
     af = asset_feat.reindex(common_idx).ffill().fillna(0.0)
     mf = macro_feat.reindex(common_idx).ffill().fillna(0.0)
 
-    # Build per-asset column indices using metadata tickers
     n_assets = len(tickers)
     asset_col_indices = []
     
     for ticker in tickers:
         cols = [c for c in af.columns if c.startswith(ticker + "_")]
         if len(cols) == 0:
-            # This should not happen with the fix to build_asset_features
-            raise ValueError(f"No features found for ticker {ticker} - model expects it but features not found!")
+            raise ValueError(f"No features found for ticker {ticker}")
         idxs = [af.columns.get_loc(c) for c in cols]
         asset_col_indices.append(idxs)
 
-    # Check that all tickers have the same number of features
     n_asset_feats_per_ticker = [len(idxs) for idxs in asset_col_indices]
     if len(set(n_asset_feats_per_ticker)) > 1:
-        print(f"[predict] Warning: Tickers have different numbers of features: {dict(zip(tickers, n_asset_feats_per_ticker))}")
+        print(f"[predict] Warning: Tickers have different feature counts")
         min_feats = min(n_asset_feats_per_ticker)
         asset_col_indices = [idxs[:min_feats] for idxs in asset_col_indices]
         n_asset_feats = min_feats
@@ -186,7 +163,6 @@ def _build_inference_tensors(option: str, master: pd.DataFrame, meta: dict) -> t
 
     last_data_date = str(af.index[-1].date())
 
-    # Regime context
     latest_macro = data["macro"].iloc[-1]
     regime_context = {
         "VIX": round(float(latest_macro.get("VIX", 0)), 2),
@@ -207,22 +183,18 @@ def generate_signal(option: str, master: pd.DataFrame) -> dict:
     X_asset, X_macro, last_data_date, regime_context, stress, tickers = \
         _build_inference_tensors(option, master, meta)
 
-    # Scale
     X_asset_s, X_macro_s = scaler.transform(X_asset, X_macro)
 
-    # Build combined spline and run inference
     X_path = build_combined_path(X_asset_s, X_macro_s)
     with torch.no_grad():
         mu, sigma = model(X_path)
 
-    mu_arr = mu.numpy()[0]  # (n_assets,)
-    sigma_arr = sigma.numpy()[0]  # (n_assets,)
+    mu_arr = mu.numpy()[0]
+    sigma_arr = sigma.numpy()[0]
 
-    # Confidence = 1 / sigma, normalised to sum to 1
     raw_conf = 1.0 / (sigma_arr + 1e-8)
     confidence = raw_conf / raw_conf.sum()
 
-    # Per-ETF forecast dict - use tickers from metadata
     forecasts = {
         tickers[i]: {
             "mu": round(float(mu_arr[i]), 6),
@@ -232,7 +204,6 @@ def generate_signal(option: str, master: pd.DataFrame) -> dict:
         for i in range(len(tickers))
     }
 
-    # Top pick = highest mu (signal), tiebreak by confidence
     top_idx = int(np.argmax(mu_arr))
     top_pick = tickers[top_idx]
     top_mu = float(mu_arr[top_idx])
@@ -240,7 +211,6 @@ def generate_signal(option: str, master: pd.DataFrame) -> dict:
 
     signal_date = next_trading_day(last_data_date)
 
-    # Backfill actual return if signal_date already in master
     actual_return, hit = _get_actual_return(top_pick, signal_date, master)
 
     print(f" Option {option}: top_pick={top_pick} | mu={top_mu:.4f} | "
@@ -267,7 +237,7 @@ def generate_signal(option: str, master: pd.DataFrame) -> dict:
         "hit": hit,
     }
 
-# ── History + upload ───────────────────────────────────────────────────────────
+# ── History ────────────────────────────────────────────────────────────────────
 
 def _load_remote_history(option: str) -> list:
     try:
@@ -322,54 +292,34 @@ def update_signal_history(signal: dict, option: str) -> None:
     except Exception as e:
         print(f"[predict] WARNING: Failed to upload history Option {option}: {e}")
 
-def save_signals(sig_A=None, sig_B=None) -> None:
+# ── Save signals ───────────────────────────────────────────────────────────────
+
+def save_signal(signal: dict, option: str) -> None:
+    """Save a single option signal to HF dataset repo."""
     os.makedirs(cfg.MODELS_DIR, exist_ok=True)
-
-    combined = {
-        "generated_at": datetime.utcnow().isoformat(),
-        "option_A": sig_A,
-        "option_B": sig_B,
-    }
-
-    local_combined = os.path.join(cfg.MODELS_DIR, "latest_signals.json")
-    with open(local_combined, "w") as f:
-        json.dump(combined, f, indent=2)
-
+    
+    filename = f"signal_{option}.json"
+    local_path = os.path.join(cfg.MODELS_DIR, filename)
+    
+    with open(local_path, "w") as f:
+        json.dump(signal, f, indent=2)
+    
     try:
         api = HfApi(token=cfg.HF_TOKEN)
-        with open(local_combined, "rb") as f:
+        with open(local_path, "rb") as f:
             api.upload_file(
                 path_or_fileobj=f,
-                path_in_repo="signals/latest_signals.json",
+                path_in_repo=f"signals/{filename}",
                 repo_id=cfg.HF_SIGNALS_REPO,
                 repo_type="dataset",
-                commit_message=f"Update latest signals ({combined['generated_at']})",
+                commit_message=f"Update {filename} ({signal['signal_date']})",
             )
-        print("[predict] Uploaded latest_signals.json")
+        print(f"[predict] Uploaded {filename}")
     except Exception as e:
-        print(f"[predict] WARNING: Failed to upload latest_signals.json: {e}")
-
-    # Upload individual signal files and update history
-    for sig, name, opt in [(sig_A, "signal_A", "A"), (sig_B, "signal_B", "B")]:
-        if sig:
-            local = os.path.join(cfg.MODELS_DIR, f"{name}.json")
-            with open(local, "w") as f:
-                json.dump(sig, f, indent=2)
-            try:
-                with open(local, "rb") as f:
-                    api.upload_file(
-                        path_or_fileobj=f,
-                        path_in_repo=f"signals/{name}.json",
-                        repo_id=cfg.HF_SIGNALS_REPO,
-                        repo_type="dataset",
-                        commit_message=f"Update {name} signal",
-                    )
-                print(f"[predict] Uploaded {name}.json")
-            except Exception as e:
-                print(f"[predict] WARNING: Failed to upload {name}.json: {e}")
-            update_signal_history(sig, opt)
-
-    print("\n[predict] Done.")
+        print(f"[predict] WARNING: Failed to upload {filename}: {e}")
+    
+    # Also update history
+    update_signal_history(signal, option)
 
 # ── Entry point ────────────────────────────────────────────────────────────────
 
@@ -381,16 +331,16 @@ if __name__ == "__main__":
     print("[predict] Loading master dataset...")
     master = loader.load_master()
 
-    sig_A = sig_B = None
-
     if args.option in ("A", "both"):
         sig_A = generate_signal("A", master)
+        save_signal(sig_A, "A")
+        print(f" Option A: {sig_A['top_pick']} on {sig_A['signal_date']} "
+              f"(mu={sig_A['top_mu']:.4f}, confidence={sig_A['top_confidence']:.2%})")
+
     if args.option in ("B", "both"):
         sig_B = generate_signal("B", master)
+        save_signal(sig_B, "B")
+        print(f" Option B: {sig_B['top_pick']} on {sig_B['signal_date']} "
+              f"(mu={sig_B['top_mu']:.4f}, confidence={sig_B['top_confidence']:.2%})")
 
-    save_signals(sig_A, sig_B)
-
-    for sig, label in [(sig_A, "A"), (sig_B, "B")]:
-        if sig:
-            print(f" Option {label}: {sig['top_pick']} on {sig['signal_date']} "
-                  f"(mu={sig['top_mu']:.4f}, confidence={sig['top_confidence']:.2%})")
+    print("\n[predict] Done.")
