@@ -1,17 +1,13 @@
 # app.py — P2-ETF-NCDE-ENGINE Streamlit Dashboard
 #
-# Tabs:
-#   📊 Option A — Fixed Income / Alts       (original NCDE, unchanged)
-#   📈 Option B — Equity Sectors            (original NCDE, unchanged)
-#   ∂̂  Conformal — FI / Commodities         (conformal intervals + diagnostics)
-#   ∂̂  Conformal — Equities                 (conformal intervals + diagnostics)
+# SIMPLIFIED: Now reads from separate signal_A.json and signal_B.json files
+# Removed dependency on combined latest_signals.json
 #
-# The conformal tabs are deliberately different from the NCDE tabs:
-#   - Signal classification dot-plot (CI positive / negative / straddles zero)
-#   - Side-by-side width comparison chart + q̂ miscalibration chart
-#   - Full q̂ table (no equivalent in NCDE tabs)
-#   - Coverage diagnostics table
-#   - Conformal history with CI covered column
+# Tabs:
+#   📊 Option A — Fixed Income / Alts
+#   📈 Option B — Equity Sectors
+#   ∂̂  Conformal — FI / Commodities
+#   ∂̂  Conformal — Equities
 
 import json
 from datetime import datetime
@@ -65,39 +61,37 @@ nyse = mcal.get_calendar("NYSE")
 # ── Data loading ───────────────────────────────────────────────────────────────
 
 @st.cache_data(ttl=300)
-def load_signals() -> dict:
+def load_signal(option: str) -> dict:
+    """Load signal for a single option (A or B) from separate file."""
     try:
         path = hf_hub_download(
             repo_id=cfg.HF_SIGNALS_REPO,
-            filename="signals/latest_signals.json",
+            filename=f"signals/signal_{option}.json",
             repo_type="dataset",
             token=cfg.HF_TOKEN or None,
             force_download=True,
         )
         with open(path) as f:
-            raw = json.load(f)
-        return {"A": raw.get("option_A") or {}, "B": raw.get("option_B") or {}}
+            return json.load(f)
     except Exception as e:
-        st.error(f"Could not load signals: {e}")
-        return {"A": {}, "B": {}}
-
+        st.error(f"Could not load signal_{option}.json: {e}")
+        return {}
 
 @st.cache_data(ttl=300)
-def load_conformal_signals() -> dict:
+def load_conformal_signal(option: str) -> dict:
+    """Load conformal signal for a single option."""
     try:
         path = hf_hub_download(
             repo_id=cfg.HF_SIGNALS_REPO,
-            filename="conformal/latest_signals_conformal.json",
+            filename=f"conformal/signal_{option}_conformal.json",
             repo_type="dataset",
             token=cfg.HF_TOKEN or None,
             force_download=True,
         )
         with open(path) as f:
-            raw = json.load(f)
-        return {"A": raw.get("option_A") or {}, "B": raw.get("option_B") or {}}
+            return json.load(f)
     except Exception:
-        return {"A": {}, "B": {}}
-
+        return {}
 
 @st.cache_data(ttl=3600)
 def load_master() -> pd.DataFrame:
@@ -122,7 +116,6 @@ def load_master() -> pd.DataFrame:
         st.error(f"Could not load master dataset: {e}")
         return pd.DataFrame()
 
-
 @st.cache_data(ttl=3600)
 def load_history(option: str) -> pd.DataFrame:
     try:
@@ -137,7 +130,6 @@ def load_history(option: str) -> pd.DataFrame:
             return pd.DataFrame(json.load(f))
     except Exception:
         return pd.DataFrame()
-
 
 @st.cache_data(ttl=3600)
 def load_conformal_history(option: str) -> pd.DataFrame:
@@ -174,7 +166,7 @@ def pill(label, val, lo, hi):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# ORIGINAL NCDE TABS (A and B) — completely unchanged
+# ORIGINAL NCDE TABS (A and B)
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def render_hero(signal: dict, master: pd.DataFrame):
@@ -345,9 +337,8 @@ def render_footnote(signal: dict):
     )
 
 
-def render_ncde_option(option: str, signals: dict, master: pd.DataFrame):
-    signal = signals.get(option, {})
-    hist   = load_history(option)
+def render_ncde_option(option: str, signal: dict, master: pd.DataFrame):
+    hist = load_history(option)
     render_hero(signal, master)
     render_model_metrics(signal)
     st.markdown("<hr style='margin:1.5rem 0 0.5rem'>", unsafe_allow_html=True)
@@ -362,7 +353,7 @@ def render_ncde_option(option: str, signals: dict, master: pd.DataFrame):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# CONFORMAL TABS (C and D) — fundamentally different from NCDE tabs
+# CONFORMAL TABS (C and D)
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def _get_conf_tickers(conf_sig: dict, option: str) -> list:
@@ -423,7 +414,6 @@ def render_conformal_hero(conf_sig: dict, option: str):
     if len(ranked) > 1: runner += f"2nd: **{ranked[1][0]}** μ={ranked[1][1]:.4f}"
     if len(ranked) > 2: runner += f"&nbsp;&nbsp;3rd: **{ranked[2][0]}** μ={ranked[2][1]:.4f}"
 
-    # Score-type-aware q̂ label
     score_type = conf_sig.get("score_type", "normalised")
     if isinstance(q_90, float):
         if score_type == "absolute":
@@ -451,12 +441,6 @@ def render_conformal_hero(conf_sig: dict, option: str):
 
 
 def render_signal_classification_chart(conf_sig: dict, option: str, alpha: str):
-    """
-    Dot-plot: μ as dot, CI as horizontal bar.
-    Color encodes signal quality: green = CI fully positive, red = CI fully negative,
-    grey = straddles zero. Sorted by μ descending.
-    Completely different from the NCDE bar chart.
-    """
     tickers = _get_conf_tickers(conf_sig, option)
     if not tickers:
         st.info("No tickers with conformal interval data yet.")
@@ -469,7 +453,6 @@ def render_signal_classification_chart(conf_sig: dict, option: str, alpha: str):
         st.info(f"No interval data at this coverage level yet.")
         return
 
-    # Sort by μ descending
     valid = sorted(valid, key=lambda t: conf_fc[t]["mu"], reverse=True)
 
     mus   = [conf_fc[t]["mu"] for t in valid]
@@ -537,11 +520,6 @@ def render_signal_classification_chart(conf_sig: dict, option: str, alpha: str):
 
 def render_interval_comparison_chart(conf_sig: dict, ncde_sig: dict,
                                      alpha: str, option: str):
-    """
-    Two-panel chart:
-    Left:  conformal CI width vs raw NCDE 2σ — shows how much q̂ inflated the interval
-    Right: q̂ per ETF — the NCDE miscalibration factor (red dashed at 1.0)
-    """
     if not conf_sig or not ncde_sig:
         return
 
@@ -565,14 +543,12 @@ def render_interval_comparison_chart(conf_sig: dict, ncde_sig: dict,
 
     width_colors = ["#3a5bd9" if t == top_pick else "#6b7280" for t in valid]
 
-    # In absolute mode q̂ is a return value (e.g. 0.015), not a multiplier.
-    # "orange if > 1.5" only makes sense for normalised mode.
     q_colors = []
     for t, q in zip(valid, q_hats):
         if t == top_pick:
             q_colors.append("#3a5bd9")
         elif score_type == "normalised" and q > 1.5:
-            q_colors.append("#f59e0b")   # orange = NCDE badly overconfident
+            q_colors.append("#f59e0b")
         else:
             q_colors.append("#9ca3af")
 
@@ -583,7 +559,6 @@ def render_interval_comparison_chart(conf_sig: dict, ncde_sig: dict,
     )
     q_axis_label = "q̂" if score_type == "normalised" else "q̂  (return units)"
 
-    # For absolute mode draw red line at the pooled q̂ value (not 1.0)
     q_ref_line = 1.0
     if score_type == "absolute":
         q_ref_line = conformal_params_pooled if (
@@ -645,7 +620,6 @@ def render_interval_comparison_chart(conf_sig: dict, ncde_sig: dict,
 
 
 def render_q_hat_table(conf_sig: dict, option: str):
-    """Full per-ETF table of μ, σ, q̂ at all levels, and CI bounds. No NCDE equivalent."""
     tickers = _get_conf_tickers(conf_sig, option)
     if not tickers:
         return
@@ -653,7 +627,6 @@ def render_q_hat_table(conf_sig: dict, option: str):
     conf_fc    = conf_sig.get("conformal_forecasts", {})
     score_type = conf_sig.get("score_type", "normalised")
 
-    # Column label and caption change depending on score type
     if score_type == "absolute":
         q_col_suffix = "% ret"
         caption = (
@@ -675,10 +648,9 @@ def render_q_hat_table(conf_sig: dict, option: str):
         q    = fc_t.get("q_hat",     {})
         ivs  = fc_t.get("intervals", {})
 
-        # For absolute mode, show q̂ as percentage for readability
         def fmt_q(v):
             if score_type == "absolute":
-                return round(v * 100, 4)   # express as % return
+                return round(v * 100, 4)
             return round(v, 4)
 
         rows.append({
@@ -736,7 +708,7 @@ def render_conformal_history_table(hist_df: pd.DataFrame):
     disp = hist_df.sort_values("signal_date", ascending=False).copy()
 
     if "hit" in disp.columns:
-        hits  = (disp["hit"] == True).sum()  # noqa
+        hits  = (disp["hit"] == True).sum()
         total = disp["hit"].notna().sum()
         hr    = hits / total if total > 0 else 0
         st.markdown(
@@ -790,14 +762,12 @@ def render_conformal_history_table(hist_df: pd.DataFrame):
     st.dataframe(disp, use_container_width=True, hide_index=True)
 
 
-def render_conformal_option(option: str, ncde_signals: dict,
-                             conf_signals: dict, master: pd.DataFrame):
-    ncde_sig   = ncde_signals.get(option, {})
-    conf_sig   = conf_signals.get(option, {})
-    score_type = conf_sig.get("score_type", "normalised") if conf_sig else "normalised"
+def render_conformal_option(option: str, ncde_signal: dict,
+                             conf_signal: dict, master: pd.DataFrame):
+    score_type = conf_signal.get("score_type", "normalised") if conf_signal else "normalised"
 
-    render_conformal_hero(conf_sig, option)
-    render_model_metrics(conf_sig)
+    render_conformal_hero(conf_signal, option)
+    render_model_metrics(conf_signal)
 
     st.markdown("<hr style='margin:1.5rem 0 0.5rem'>", unsafe_allow_html=True)
 
@@ -810,7 +780,6 @@ def render_conformal_option(option: str, ncde_signals: dict,
         format_func=lambda x: f"{int(float(x)*100)}%",
     )
 
-    # ── 1. Signal classification dot-plot ─────────────────────────────────────
     st.markdown(
         f'<div class="section-hdr">'
         f'Signal classification — conformal {int(float(alpha_choice)*100)}% intervals'
@@ -824,9 +793,8 @@ def render_conformal_option(option: str, ncde_signals: dict,
         "🔴 CI entirely negative (avoid) &nbsp;·&nbsp; "
         "⚫ CI crosses zero (uncertain)."
     )
-    render_signal_classification_chart(conf_sig, option, alpha_choice)
+    render_signal_classification_chart(conf_signal, option, alpha_choice)
 
-    # ── 2. Width + q̂ chart ────────────────────────────────────────────────────
     st.markdown(
         '<div class="section-hdr">'
         'Interval width vs NCDE 2σ, and q̂ miscalibration factor'
@@ -846,33 +814,29 @@ def render_conformal_option(option: str, ncde_signals: dict,
             "Red line = 1.0 (perfectly calibrated). Orange = q̂ > 1.5 (NCDE was overconfident here)."
         )
     st.caption(width_caption)
-    render_interval_comparison_chart(conf_sig, ncde_sig, alpha_choice, option)
+    render_interval_comparison_chart(conf_signal, ncde_signal, alpha_choice, option)
 
-    # ── 3. Full q̂ table ───────────────────────────────────────────────────────
     st.markdown(
         '<div class="section-hdr">Full conformal table — μ, σ, q̂ at all levels</div>',
         unsafe_allow_html=True,
     )
-    render_q_hat_table(conf_sig, option)
+    render_q_hat_table(conf_signal, option)
 
-    # ── 4. Coverage diagnostics ───────────────────────────────────────────────
     st.markdown("<hr style='margin:1.5rem 0 0.5rem'>", unsafe_allow_html=True)
-    render_coverage_diagnostics(conf_sig)
+    render_coverage_diagnostics(conf_signal)
 
-    # ── 5. History ────────────────────────────────────────────────────────────
     st.markdown("<hr style='margin:1.5rem 0 0.5rem'>", unsafe_allow_html=True)
     st.markdown('<div class="section-hdr">Conformal signal history</div>',
                 unsafe_allow_html=True)
     render_conformal_history_table(load_conformal_history(option))
 
-    # ── Footnote ──────────────────────────────────────────────────────────────
-    if conf_sig:
+    if conf_signal:
         st.markdown(
             f"<div style='font-size:0.8rem;color:#9ca3af;margin-top:1rem'>"
-            f"Calibration set: {conf_sig.get('n_cal','?')} samples &nbsp;·&nbsp; "
-            f"{conf_sig.get('cal_period','?')} &nbsp;·&nbsp; "
-            f"Calibrated {_fmt_dt(conf_sig.get('calibrated_at',''))} &nbsp;·&nbsp; "
-            f"Params: {conf_sig.get('model_n_params', 0):,}"
+            f"Calibration set: {conf_signal.get('n_cal','?')} samples &nbsp;·&nbsp; "
+            f"{conf_signal.get('cal_period','?')} &nbsp;·&nbsp; "
+            f"Calibrated {_fmt_dt(conf_signal.get('calibrated_at',''))} &nbsp;·&nbsp; "
+            f"Params: {conf_signal.get('model_n_params', 0):,}"
             f"</div>",
             unsafe_allow_html=True,
         )
@@ -899,9 +863,11 @@ def main():
             st.rerun()
 
     with st.spinner("Loading signals and data..."):
-        signals        = load_signals()
-        conformal_sigs = load_conformal_signals()
-        master         = load_master()
+        signal_A = load_signal("A")
+        signal_B = load_signal("B")
+        conformal_A = load_conformal_signal("A")
+        conformal_B = load_conformal_signal("B")
+        master = load_master()
 
     tab_a, tab_b, tab_ca, tab_cb = st.tabs([
         "📊 Option A — Fixed Income / Alts",
@@ -911,10 +877,10 @@ def main():
     ])
 
     with tab_a:
-        render_ncde_option("A", signals, master)
+        render_ncde_option("A", signal_A, master)
 
     with tab_b:
-        render_ncde_option("B", signals, master)
+        render_ncde_option("B", signal_B, master)
 
     with tab_ca:
         with st.expander("ℹ️ What is conformal prediction?", expanded=False):
@@ -931,10 +897,10 @@ no distributional assumptions required.
 - **Coverage diagnostics** — verifies the theoretical guarantee is met on the calibration set
 - **CI covered** in history — tracks whether the actual return fell inside the interval
 """)
-        render_conformal_option("A", signals, conformal_sigs, master)
+        render_conformal_option("A", signal_A, conformal_A, master)
 
     with tab_cb:
-        render_conformal_option("B", signals, conformal_sigs, master)
+        render_conformal_option("B", signal_B, conformal_B, master)
 
     st.markdown(
         "<hr style='margin:2rem 0 1rem'>"
