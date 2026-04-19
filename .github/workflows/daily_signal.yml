@@ -1,0 +1,114 @@
+name: Daily Signal
+
+# Runs Mon–Fri at 23:00 UTC (1 hour after DeePM data update at 22:00 UTC).
+# Downloads already-trained model artifacts from HuggingFace, generates
+# signals, and verifies the conformal output — no training involved.
+#
+# For a full retrain + signal run, use train_and_signal.yml instead.
+
+on:
+  schedule:
+    - cron: "0 23 * * 1-5"    # Mon–Fri 23:00 UTC
+  workflow_dispatch: {}        # allow manual trigger anytime
+
+jobs:
+  signal:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      # ── Checkout ────────────────────────────────────────────────────────────
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      # ── Python ──────────────────────────────────────────────────────────────
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Cache pip (predict deps)
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-pred-${{ hashFiles('requirements.txt') }}
+          restore-keys: ${{ runner.os }}-pip-pred-
+
+      - name: Install predict dependencies
+        run: pip install -r requirements.txt
+
+      # ── Download trained model artifacts from HuggingFace ───────────────────
+      - name: Download model artifacts
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: |
+          python - <<'EOF'
+          import os
+          from huggingface_hub import hf_hub_download
+          import config as cfg
+
+          os.makedirs(cfg.MODELS_DIR, exist_ok=True)
+
+          for opt in ["A", "B"]:
+              for fname in [
+                  f"ncde_option{opt}_best.pt",
+                  f"meta_option{opt}.json",
+                  f"scaler_option{opt}.pkl",
+              ]:
+                  try:
+                      hf_hub_download(
+                          repo_id=cfg.HF_SIGNALS_REPO,
+                          filename=f"models/{fname}",
+                          repo_type="dataset",
+                          token=cfg.HF_TOKEN or None,
+                          local_dir=".",
+                          local_dir_use_symlinks=False,
+                      )
+                      print(f"  Downloaded models/{fname}")
+                  except Exception as e:
+                      print(f"  WARNING: Could not download models/{fname}: {e}")
+          print("Model download complete.")
+          EOF
+
+      # ── Generate signals ─────────────────────────────────────────────────────
+      - name: Generate daily signals
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: |
+          python predict.py --option both
+
+      # ── Verify conformal output ──────────────────────────────────────────────
+      - name: Verify conformal signal output
+        run: |
+          python - <<'EOF'
+          import json, os, sys
+          path = "models/latest_signals_conformal.json"
+          if not os.path.exists(path):
+              print("ERROR: latest_signals_conformal.json not found")
+              sys.exit(1)
+          with open(path) as f:
+              d = json.load(f)
+          ok = False
+          for key in ["option_A", "option_B"]:
+              sig = d.get(key)
+              if sig and sig.get("top_pick"):
+                  iv = sig.get("top_interval_90", {})
+                  print(f"  {key}: {sig['top_pick']}  mu={sig['top_mu']:.4f}  "
+                        f"90% CI=[{iv.get('lo','?')}, {iv.get('hi','?')}]  "
+                        f"signal_date={sig['signal_date']}")
+                  ok = True
+              else:
+                  print(f"  {key}: no signal")
+          if not ok:
+              sys.exit(1)
+          EOF
+
+      # ── Commit signal artifacts back to repo ─────────────────────────────────
+      - name: Commit signal artifacts
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add models/latest_signals*.json models/signal_*.json || true
+          git diff --cached --quiet || \
+            git commit -m "chore: daily signal $(date -u +'%Y-%m-%d')"
+          git push || true
