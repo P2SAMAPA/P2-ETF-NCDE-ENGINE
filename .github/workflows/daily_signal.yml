@@ -1,15 +1,17 @@
 name: Daily Signal
 
-# Runs Mon–Fri at 23:00 UTC (1 hour after DeePM data update at 22:00 UTC).
-# Downloads already-trained model artifacts from HuggingFace, generates
-# signals, and verifies the conformal output — no training involved.
+# Mon–Fri 23:00 UTC — downloads existing model artifacts, runs the full
+# signal pipeline (NCDE predict → conformal wrap → verify), no training.
 #
-# For a full retrain + signal run, use train_and_signal.yml instead.
+# File layout produced:
+#   models/conformal_params_option{A|B}.json   ← downloaded from HF (has "quantiles")
+#   models/conformal_signal_option{A|B}.json   ← wrapped signal output
+#   models/latest_signals_conformal.json        ← combined file for CI check
 
 on:
   schedule:
-    - cron: "0 23 * * 1-5"    # Mon–Fri 23:00 UTC
-  workflow_dispatch: {}        # allow manual trigger anytime
+    - cron: "0 23 * * 1-5"
+  workflow_dispatch: {}
 
 jobs:
   signal:
@@ -17,28 +19,26 @@ jobs:
     timeout-minutes: 30
 
     steps:
-      # ── Checkout ────────────────────────────────────────────────────────────
       - name: Checkout repo
         uses: actions/checkout@v4
 
-      # ── Python ──────────────────────────────────────────────────────────────
       - name: Set up Python 3.11
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
-      - name: Cache pip (predict deps)
+      - name: Cache pip
         uses: actions/cache@v4
         with:
           path: ~/.cache/pip
           key: ${{ runner.os }}-pip-pred-${{ hashFiles('requirements.txt') }}
           restore-keys: ${{ runner.os }}-pip-pred-
 
-      - name: Install predict dependencies
+      - name: Install dependencies
         run: pip install -r requirements.txt
 
-      # ── Download trained model artifacts from HuggingFace ───────────────────
-      - name: Download model artifacts
+      # ── Download model + conformal param artifacts from HF ──────────────────
+      - name: Download artifacts
         env:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
         run: |
@@ -49,12 +49,20 @@ jobs:
 
           os.makedirs(cfg.MODELS_DIR, exist_ok=True)
 
+          # Model weights + metadata
+          model_files = [
+              "ncde_option{opt}_best.pt",
+              "meta_option{opt}.json",
+              "scaler_option{opt}.pkl",
+          ]
+          # Conformal calibration params (new name first, old name as fallback)
+          conformal_files = [
+              "conformal_params_option{opt}.json",   # new canonical name
+          ]
+
           for opt in ["A", "B"]:
-              for fname in [
-                  f"ncde_option{opt}_best.pt",
-                  f"meta_option{opt}.json",
-                  f"scaler_option{opt}.pkl",
-              ]:
+              for tmpl in model_files:
+                  fname = tmpl.format(opt=opt)
                   try:
                       hf_hub_download(
                           repo_id=cfg.HF_SIGNALS_REPO,
@@ -67,17 +75,53 @@ jobs:
                       print(f"  Downloaded models/{fname}")
                   except Exception as e:
                       print(f"  WARNING: Could not download models/{fname}: {e}")
-          print("Model download complete.")
+
+              for tmpl in conformal_files:
+                  fname   = tmpl.format(opt=opt)
+                  hf_path = f"conformal/{fname}"
+                  local   = os.path.join(cfg.MODELS_DIR, fname)
+                  try:
+                      hf_hub_download(
+                          repo_id=cfg.HF_SIGNALS_REPO,
+                          filename=hf_path,
+                          repo_type="dataset",
+                          token=cfg.HF_TOKEN or None,
+                          local_dir=cfg.MODELS_DIR,
+                          local_dir_use_symlinks=False,
+                      )
+                      print(f"  Downloaded {hf_path}")
+                  except Exception:
+                      # Fall back to old name if new name not uploaded yet
+                      old_hf = f"conformal/conformal_option{opt}.json"
+                      try:
+                          hf_hub_download(
+                              repo_id=cfg.HF_SIGNALS_REPO,
+                              filename=old_hf,
+                              repo_type="dataset",
+                              token=cfg.HF_TOKEN or None,
+                              local_dir=cfg.MODELS_DIR,
+                              local_dir_use_symlinks=False,
+                          )
+                          print(f"  Downloaded (legacy) {old_hf}")
+                      except Exception as e2:
+                          print(f"  WARNING: No conformal params for Option {opt}: {e2}")
+
+          print("Artifact download complete.")
           EOF
 
-      # ── Generate signals ─────────────────────────────────────────────────────
-      - name: Generate daily signals
+      # ── Generate raw NCDE signals ────────────────────────────────────────────
+      - name: Generate NCDE signals
         env:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
-        run: |
-          python predict.py --option both
+        run: python predict.py --option both
 
-      # ── Verify conformal output ──────────────────────────────────────────────
+      # ── Wrap with conformal intervals ────────────────────────────────────────
+      - name: Wrap signals with conformal intervals
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: python -m conformal.predict_conformal --option both
+
+      # ── Verify output ────────────────────────────────────────────────────────
       - name: Verify conformal signal output
         run: |
           python - <<'EOF'
@@ -103,12 +147,14 @@ jobs:
               sys.exit(1)
           EOF
 
-      # ── Commit signal artifacts back to repo ─────────────────────────────────
+      # ── Commit signal artifacts ──────────────────────────────────────────────
       - name: Commit signal artifacts
         run: |
           git config user.name  "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add models/latest_signals*.json models/signal_*.json || true
+          git add models/latest_signals*.json \
+                  models/conformal_signal_*.json \
+                  models/signal_*.json || true
           git diff --cached --quiet || \
             git commit -m "chore: daily signal $(date -u +'%Y-%m-%d')"
           git push || true
