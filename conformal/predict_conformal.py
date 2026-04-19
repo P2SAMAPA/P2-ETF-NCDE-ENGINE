@@ -1,5 +1,17 @@
 # conformal/predict_conformal.py — Wrap NCDE signals with conformal intervals
 #
+# FIX: Resolved filename collision between calibration params and signal output.
+#
+#   BEFORE (broken):
+#     calibrate.py  saved params  → models/conformal_option{A|B}.json
+#     predict_conformal.py saved signal → models/conformal_option{A|B}.json  ← SAME NAME
+#     Result: next run downloads the signal file, finds no "quantiles" key → KeyError
+#
+#   AFTER (fixed):
+#     calibration params  → models/conformal_params_option{A|B}.json   (new name)
+#     signal output       → models/conformal_signal_option{A|B}.json   (new name)
+#     HF paths mirror the same distinction
+#
 # Supports two score types (determined by what calibrate.py used):
 #
 #   absolute   (recommended):
@@ -11,12 +23,10 @@
 #     q̂ is in sigma-units — only meaningful if sigma ≈ return scale
 #
 # The score_type is read from the calibration JSON automatically.
-# No flag needed — just run predict_conformal.py as normal.
-#
 # Self-healing: auto-calibrates (absolute mode) if params missing.
 #
-# SIMPLIFIED: Now saves only two separate files (conformal_optionA.json and 
-# conformal_optionB.json) plus history files. Removed combined latest_signals_conformal.json.
+# Also writes models/latest_signals_conformal.json — the combined file
+# expected by the CI verification step.
 #
 # Usage:
 #   python -m conformal.predict_conformal --option both
@@ -32,10 +42,30 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import config as cfg
 
 
+# ── Filename helpers ──────────────────────────────────────────────────────────
+# Centralised so every function uses the same names consistently.
+
+def _params_local(option: str) -> str:
+    """Local path for calibration params (has 'quantiles' key)."""
+    return os.path.join(cfg.MODELS_DIR, f"conformal_params_option{option}.json")
+
+def _params_hf(option: str) -> str:
+    """HF repo path for calibration params."""
+    return f"conformal/conformal_params_option{option}.json"
+
+def _signal_local(option: str) -> str:
+    """Local path for conformal-wrapped signal output."""
+    return os.path.join(cfg.MODELS_DIR, f"conformal_signal_option{option}.json")
+
+def _signal_hf(option: str) -> str:
+    """HF repo path for conformal-wrapped signal output."""
+    return f"conformal/conformal_signal_option{option}.json"
+
+
 # ── Loaders ───────────────────────────────────────────────────────────────────
 
 def load_ncde_signal(option: str) -> dict:
-    """Load NCDE signal for a single option from separate file."""
+    """Load raw NCDE signal for a single option."""
     local = os.path.join(cfg.MODELS_DIR, f"signal_{option}.json")
     if os.path.exists(local):
         with open(local) as f:
@@ -48,6 +78,7 @@ def load_ncde_signal(option: str) -> dict:
             repo_type="dataset",
             token=cfg.HF_TOKEN or None,
             local_dir=cfg.MODELS_DIR,
+            local_dir_use_symlinks=False,
         )
         with open(path) as f:
             return json.load(f)
@@ -58,23 +89,60 @@ def load_ncde_signal(option: str) -> dict:
 
 
 def load_conformal_params(option: str) -> dict | None:
-    local = os.path.join(cfg.MODELS_DIR, f"conformal_option{option}.json")
+    """
+    Load calibration params (the file with 'quantiles').
+    Uses the new _params_* names to avoid collision with signal output.
+    Also accepts the old name conformal_option{X}.json as a fallback
+    so existing calibrations are not wasted.
+    """
+    # 1. New canonical name
+    local = _params_local(option)
     if os.path.exists(local):
         with open(local) as f:
-            return json.load(f)
-    try:
-        from huggingface_hub import hf_hub_download
-        path = hf_hub_download(
-            repo_id=cfg.HF_SIGNALS_REPO,
-            filename=f"conformal/conformal_option{option}.json",
-            repo_type="dataset",
-            token=cfg.HF_TOKEN or None,
-            local_dir=cfg.MODELS_DIR,
-        )
-        with open(path) as f:
-            return json.load(f)
-    except Exception:
-        return None
+            data = json.load(f)
+        if "quantiles" in data:
+            return data
+        # File exists but is the old signal output (no quantiles) — ignore it
+        print(f"[predict_conformal] WARNING: {local} has no 'quantiles' key "
+              f"— likely old signal file. Will try HF or re-calibrate.")
+
+    # 2. Old name still on disk (calibrate.py hasn't been re-run yet)
+    old_local = os.path.join(cfg.MODELS_DIR, f"conformal_option{option}.json")
+    if os.path.exists(old_local):
+        with open(old_local) as f:
+            data = json.load(f)
+        if "quantiles" in data:
+            print(f"[predict_conformal] Found legacy params at {old_local} — "
+                  f"copying to {local} for future runs.")
+            os.makedirs(cfg.MODELS_DIR, exist_ok=True)
+            with open(local, "w") as f:
+                json.dump(data, f, indent=2)
+            return data
+
+    # 3. Try HF (new name first, then old)
+    for hf_path in [_params_hf(option),
+                    f"conformal/conformal_option{option}.json"]:
+        try:
+            from huggingface_hub import hf_hub_download
+            dl = hf_hub_download(
+                repo_id=cfg.HF_SIGNALS_REPO,
+                filename=hf_path,
+                repo_type="dataset",
+                token=cfg.HF_TOKEN or None,
+                local_dir=cfg.MODELS_DIR,
+                local_dir_use_symlinks=False,
+            )
+            with open(dl) as f:
+                data = json.load(f)
+            if "quantiles" in data:
+                # Save under canonical name for next time
+                with open(local, "w") as f:
+                    json.dump(data, f, indent=2)
+                return data
+        except Exception:
+            continue
+
+    return None
 
 
 # ── Auto-calibration ──────────────────────────────────────────────────────────
@@ -103,7 +171,8 @@ def ensure_calibrated(option: str) -> dict:
     params = load_conformal_params(option)
     if params is None:
         raise RuntimeError(
-            f"Calibration ran but conformal_option{option}.json still not found."
+            f"Calibration ran but conformal params for Option {option} "
+            f"still not found. Check calibrate.py output."
         )
     return params
 
@@ -116,10 +185,7 @@ def _compute_interval(mu: float, sigma: float, q: float,
     absolute  : half-width = q           (q is in return units, e.g. 0.015 = 1.5%)
     normalised: half-width = q * sigma   (q is in sigma units)
     """
-    if score_type == "absolute":
-        half = q
-    else:
-        half = q * sigma
+    half = q if score_type == "absolute" else q * sigma
     return mu - half, mu + half
 
 
@@ -129,7 +195,7 @@ def wrap_signal(ncde_signal: dict, conformal_params: dict) -> dict:
     Point forecast (mu, top_pick ranking) is completely unchanged.
     """
     forecasts  = ncde_signal.get("forecasts", {})
-    quantiles  = conformal_params["quantiles"]
+    quantiles  = conformal_params["quantiles"]   # KeyError impossible after fix
     tickers    = conformal_params["tickers"]
     score_type = conformal_params.get("score_type", "normalised")
 
@@ -148,9 +214,9 @@ def wrap_signal(ncde_signal: dict, conformal_params: dict) -> dict:
             q      = q_info["per_etf"].get(ticker, q_info["pooled"])
             lo, hi = _compute_interval(mu, sigma, q, score_type)
             intervals[alpha_str] = {
-                "lo":    round(lo,       6),
-                "hi":    round(hi,       6),
-                "width": round(hi - lo,  6),
+                "lo":    round(lo,      6),
+                "hi":    round(hi,      6),
+                "width": round(hi - lo, 6),
             }
             q_hat[alpha_str] = round(q, 6)
 
@@ -163,15 +229,14 @@ def wrap_signal(ncde_signal: dict, conformal_params: dict) -> dict:
             "score_type": score_type,
         }
 
-    top_pick        = ncde_signal["top_pick"]
-    top_mu          = ncde_signal["top_mu"]
-    top_confidence  = ncde_signal["top_confidence"]
+    top_pick       = ncde_signal["top_pick"]
+    top_mu         = ncde_signal["top_mu"]
+    top_confidence = ncde_signal["top_confidence"]
     top_interval_90 = (conformal_forecasts
                        .get(top_pick, {})
                        .get("intervals", {})
                        .get("0.9", {}))
 
-    # Human-readable label for the UI
     pooled_q_90 = quantiles.get("0.9", {}).get("pooled", 0)
     if score_type == "absolute":
         q_label = f"±{pooled_q_90*100:.3f}% return  (pooled 90%)"
@@ -212,18 +277,40 @@ def wrap_signal(ncde_signal: dict, conformal_params: dict) -> dict:
 
 # ── Save + upload ─────────────────────────────────────────────────────────────
 
-def save_conformal_signal(signal: dict, option: str):
-    """Save a single conformal signal to HF dataset repo."""
+def save_conformal_signal(sig_A: dict | None, sig_B: dict | None):
+    """
+    Save individual conformal signal files and the combined
+    latest_signals_conformal.json expected by the CI verification step.
+    """
     os.makedirs(cfg.MODELS_DIR, exist_ok=True)
-    
-    filename = f"conformal_option{option}.json"
-    local_path = os.path.join(cfg.MODELS_DIR, filename)
-    
-    with open(local_path, "w") as f:
-        json.dump(signal, f, indent=2)
-    
-    print(f"[predict_conformal] Saved locally → {local_path}")
 
+    hf_uploads = []   # list of (local_path, repo_path) to upload
+
+    # ── Individual option files ───────────────────────────────────────────────
+    for sig, option in [(sig_A, "A"), (sig_B, "B")]:
+        if sig is None:
+            continue
+        local = _signal_local(option)
+        with open(local, "w") as f:
+            json.dump(sig, f, indent=2)
+        print(f"[predict_conformal] Saved → {local}")
+        hf_uploads.append((local, _signal_hf(option)))
+        _update_conformal_history(sig, option)
+
+    # ── Combined file for CI verification ────────────────────────────────────
+    combined = {
+        "generated_at": datetime.utcnow().isoformat(),
+        "option_A":     sig_A,
+        "option_B":     sig_B,
+    }
+    combined_local = os.path.join(cfg.MODELS_DIR, "latest_signals_conformal.json")
+    with open(combined_local, "w") as f:
+        json.dump(combined, f, indent=2)
+    print(f"[predict_conformal] Saved → {combined_local}")
+    hf_uploads.append((combined_local,
+                       "conformal/latest_signals_conformal.json"))
+
+    # ── Upload all to HF ──────────────────────────────────────────────────────
     if not cfg.HF_TOKEN:
         print("[predict_conformal] No HF_TOKEN — skipping upload.")
         return
@@ -231,21 +318,22 @@ def save_conformal_signal(signal: dict, option: str):
     try:
         from huggingface_hub import HfApi
         api = HfApi(token=cfg.HF_TOKEN)
-        with open(local_path, "rb") as f:
-            api.upload_file(
-                path_or_fileobj=f,
-                path_in_repo=f"conformal/{filename}",
-                repo_id=cfg.HF_SIGNALS_REPO,
-                repo_type="dataset",
-                commit_message=f"Update conformal signal Option {option} ({signal['signal_date']})",
-            )
-        print(f"[predict_conformal] Uploaded {filename} → {cfg.HF_SIGNALS_REPO}")
+        for local_path, repo_path in hf_uploads:
+            with open(local_path, "rb") as f:
+                api.upload_file(
+                    path_or_fileobj=f,
+                    path_in_repo=repo_path,
+                    repo_id=cfg.HF_SIGNALS_REPO,
+                    repo_type="dataset",
+                    commit_message=f"Update {os.path.basename(repo_path)} "
+                                   f"({combined['generated_at'][:10]})",
+                )
+            print(f"[predict_conformal] Uploaded → {repo_path}")
     except Exception as e:
-        print(f"[predict_conformal] WARNING: upload failed: {e}")
+        print(f"[predict_conformal] WARNING: HF upload failed: {e}")
 
-    # Update history
-    _update_conformal_history(signal, option)
 
+# ── History ───────────────────────────────────────────────────────────────────
 
 def _update_conformal_history(sig: dict, option: str):
     history_path = os.path.join(
@@ -264,6 +352,7 @@ def _update_conformal_history(sig: dict, option: str):
                 repo_type="dataset",
                 token=cfg.HF_TOKEN or None,
                 local_dir=cfg.MODELS_DIR,
+                local_dir_use_symlinks=False,
             )
             with open(dl) as f:
                 history = json.load(f)
@@ -293,8 +382,8 @@ def _update_conformal_history(sig: dict, option: str):
         for r in history:
             if r["signal_date"] == record["signal_date"]:
                 if record["actual_return"] is not None:
-                    r["actual_return"] = record["actual_return"]
-                    r["hit"] = record["hit"]
+                    r["actual_return"]   = record["actual_return"]
+                    r["hit"]             = record["hit"]
                     lo = r.get("interval_90_lo")
                     hi = r.get("interval_90_hi")
                     if lo is not None and hi is not None:
@@ -332,7 +421,8 @@ def run_option(option: str) -> dict | None:
     try:
         ncde_sig = load_ncde_signal(option)
     except FileNotFoundError as e:
-        print(f"[predict_conformal] NCDE Option {option} signal not found — skipping: {e}")
+        print(f"[predict_conformal] NCDE Option {option} signal not found — "
+              f"skipping: {e}")
         return None
 
     if not isinstance(ncde_sig, dict) or "top_pick" not in ncde_sig:
@@ -348,13 +438,12 @@ def run_option(option: str) -> dict | None:
         print(f"[predict_conformal] Option {option} calibration error: {e}")
         return None
 
-    wrapped    = wrap_signal(ncde_sig, params)
-    iv90       = wrapped.get("top_interval_90", {})
-    score_type = wrapped.get("score_type", "?")
+    wrapped = wrap_signal(ncde_sig, params)
+    iv90    = wrapped.get("top_interval_90", {})
     print(f"[predict_conformal]   Option {option}: {wrapped['top_pick']}  "
           f"μ={wrapped['top_mu']:.4f}  "
           f"90% CI=[{iv90.get('lo','?')}, {iv90.get('hi','?')}]  "
-          f"({score_type})  "
+          f"({wrapped.get('score_type','?')})  "
           f"signal_date={wrapped['signal_date']}")
     return wrapped
 
@@ -374,10 +463,16 @@ if __name__ == "__main__":
 
     options = ["A", "B"] if args.option == "both" else [args.option]
 
+    sig_A = sig_B = None
     for opt in options:
         print(f"[predict_conformal] Processing Option {opt}...")
-        signal = run_option(opt)
-        if signal:
-            save_conformal_signal(signal, opt)
+        sig = run_option(opt)
+        if opt == "A":
+            sig_A = sig
+        else:
+            sig_B = sig
+
+    # Save everything (individual files + combined CI file) in one pass
+    save_conformal_signal(sig_A, sig_B)
 
     print("[predict_conformal] Done.")
