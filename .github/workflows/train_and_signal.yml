@@ -1,68 +1,87 @@
-name: Train NCDE + Generate Signal
+name: Train NCDE + Calibrate + Generate Signal
 
-# FIX (b): Combines the old train.yml and daily_predict.yml into one workflow.
-# After training completes, predict.py runs immediately in the same job —
-# no need for a second workflow or a separate trigger.
+# Full pipeline: train → calibrate conformal → generate signals → verify
 #
-# This workflow is for:
-#   • Manual reruns (workflow_dispatch)
-#   • Scheduled weekly retraining (Sunday night)
+# File layout after this run:
+#   models/conformal_params_option{A|B}.json   ← calibration params (has "quantiles")
+#   models/conformal_signal_option{A|B}.json   ← wrapped signal output
+#   models/latest_signals_conformal.json        ← combined CI check file
 #
-# The separate daily_signal.yml handles weekday-only signal generation
-# (without retraining) using the already-trained model artifacts.
+# The old conformal_option{X}.json files on HF are superseded by the new
+# split naming scheme. predict_conformal.py falls back to them automatically
+# for one cycle if they exist, then switches to the new names.
 
 on:
   workflow_dispatch:
     inputs:
       option:
-        description: "Which option to train and signal (A / B / both)"
+        description: "Which option to train (A / B / both)"
         required: false
         default: "both"
+      score_type:
+        description: "Conformal score type (absolute / normalised)"
+        required: false
+        default: "absolute"
   schedule:
-    # Weekly retrain: Sunday 20:00 UTC (after markets close, before Mon open)
+    # Weekly retrain: Sunday 20:00 UTC
     - cron: "0 20 * * 0"
 
 jobs:
-  train-and-signal:
+  train-calibrate-signal:
     runs-on: ubuntu-latest
-    timeout-minutes: 360       # up to 6h for CPU training on free tier
+    timeout-minutes: 360
 
     steps:
-      # ── Checkout ────────────────────────────────────────────────────────────
       - name: Checkout repo
         uses: actions/checkout@v4
 
-      # ── Python ──────────────────────────────────────────────────────────────
       - name: Set up Python 3.11
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
-      - name: Cache pip (train deps)
+      - name: Cache pip
         uses: actions/cache@v4
         with:
           path: ~/.cache/pip
           key: ${{ runner.os }}-pip-train-${{ hashFiles('requirements_train.txt') }}
           restore-keys: ${{ runner.os }}-pip-train-
 
-      - name: Install training dependencies
+      - name: Install dependencies
         run: pip install -r requirements_train.txt
 
-      # ── Train ────────────────────────────────────────────────────────────────
+      # ── Step 1: Train ────────────────────────────────────────────────────────
       - name: Train NCDE models
         env:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
         run: |
           python train.py --option ${{ github.event.inputs.option || 'both' }}
 
-      # ── Signal (immediately after train, same job) ───────────────────────────
-      - name: Generate signals
+      # ── Step 2: Calibrate conformal params ───────────────────────────────────
+      - name: Calibrate conformal intervals
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: |
+          python -m conformal.calibrate \
+            --option ${{ github.event.inputs.option || 'both' }} \
+            --score_type ${{ github.event.inputs.score_type || 'absolute' }}
+
+      # ── Step 3: Generate raw NCDE signals ───────────────────────────────────
+      - name: Generate NCDE signals
         env:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
         run: |
           python predict.py --option ${{ github.event.inputs.option || 'both' }}
 
-      # ── Verify conformal output ──────────────────────────────────────────────
+      # ── Step 4: Wrap with conformal intervals ────────────────────────────────
+      - name: Wrap signals with conformal intervals
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: |
+          python -m conformal.predict_conformal \
+            --option ${{ github.event.inputs.option || 'both' }}
+
+      # ── Step 5: Verify output ────────────────────────────────────────────────
       - name: Verify conformal signal output
         run: |
           python - <<'EOF'
@@ -88,12 +107,12 @@ jobs:
               sys.exit(1)
           EOF
 
-      # ── Commit model + signal artifacts back to repo ─────────────────────────
+      # ── Step 6: Commit artifacts ─────────────────────────────────────────────
       - name: Commit artifacts
         run: |
           git config user.name  "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add models/ || true
           git diff --cached --quiet || \
-            git commit -m "chore: retrain + signal $(date -u +'%Y-%m-%d')"
+            git commit -m "chore: retrain + calibrate + signal $(date -u +'%Y-%m-%d')"
           git push || true
