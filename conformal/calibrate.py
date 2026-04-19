@@ -1,5 +1,9 @@
 # conformal/calibrate.py — Conformal calibration for NCDE forecasts
 #
+# FIX: Output filename changed from conformal_option{X}.json
+#      to conformal_params_option{X}.json to avoid collision with
+#      the signal output file written by predict_conformal.py.
+#
 # THEORY (split conformal prediction, Angelopoulos & Bates 2022):
 # ─────────────────────────────────────────────────────────────────
 # Two scoring modes are supported (--score_type flag):
@@ -26,8 +30,8 @@
 #   python -m conformal.calibrate --option both --score_type absolute
 #   python -m conformal.calibrate --option both --score_type normalised
 #
-# Output: models/conformal_option{A|B}.json
-# Uploaded to HF: conformal/conformal_option{A|B}.json
+# Output: models/conformal_params_option{A|B}.json   ← NEW NAME
+# Uploaded to HF: conformal/conformal_params_option{A|B}.json   ← NEW NAME
 
 import argparse
 import json
@@ -46,10 +50,9 @@ import loader
 import features as feat
 from predict import load_model, build_combined_path
 
-DEVICE     = torch.device("cpu")
+DEVICE       = torch.device("cpu")
 ALPHA_LEVELS = [0.90, 0.80, 0.70]
-
-SCORE_TYPES = ("normalised", "absolute")
+SCORE_TYPES  = ("normalised", "absolute")
 
 
 # ── Val-set residuals ─────────────────────────────────────────────────────────
@@ -117,10 +120,10 @@ def collect_calibration_scores(option: str, score_type: str) -> dict:
     residuals = np.abs(y_val - mu_arr)              # (n_cal, n_assets)
 
     if score_type == "normalised":
-        scores = residuals / (sigma_arr + 1e-8)
+        scores      = residuals / (sigma_arr + 1e-8)
         score_label = "|y - μ| / σ"
     else:  # absolute
-        scores = residuals
+        scores      = residuals
         score_label = "|y - μ|  (return units)"
 
     print(f"[calibrate]   Score ({score_label}):")
@@ -129,30 +132,30 @@ def collect_calibration_scores(option: str, score_type: str) -> dict:
           f"p90={np.percentile(scores, 90):.5f}  "
           f"p95={np.percentile(scores, 95):.5f}")
 
-    # Sanity check for normalised mode — warn if sigma >> residuals
+    # Sanity check for normalised mode
     if score_type == "normalised":
         sigma_mean = sigma_arr.mean()
         resid_mean = residuals.mean()
         if sigma_mean > resid_mean * 10:
             print(
                 f"[calibrate]   WARNING: sigma_mean={sigma_mean:.4f} is "
-                f"{sigma_mean/resid_mean:.0f}x larger than residual_mean={resid_mean:.5f}. "
+                f"{sigma_mean/resid_mean:.0f}x larger than "
+                f"residual_mean={resid_mean:.5f}. "
                 f"This will produce q̂ ≈ 0 and trivially narrow intervals. "
-                f"Consider using --score_type absolute instead."
+                f"Consider --score_type absolute instead."
             )
 
     return {
-        "tickers":   tickers,
-        "scores":    scores.tolist(),
-        "score_type": score_type,
+        "tickers":     tickers,
+        "scores":      scores.tolist(),
+        "score_type":  score_type,
         "score_label": score_label,
-        "n_cal":     n_cal,
-        "val_start": meta["splits"]["train_end"],
-        "val_end":   meta["splits"]["val_end"],
-        # diagnostics
-        "score_mean": round(float(scores.mean()),  6),
-        "score_p50":  round(float(np.median(scores)), 6),
-        "score_p90":  round(float(np.percentile(scores, 90)), 6),
+        "n_cal":       n_cal,
+        "val_start":   meta["splits"]["train_end"],
+        "val_end":     meta["splits"]["val_end"],
+        "score_mean":  round(float(scores.mean()),              6),
+        "score_p50":   round(float(np.median(scores)),          6),
+        "score_p90":   round(float(np.percentile(scores, 90)),  6),
     }
 
 
@@ -162,9 +165,6 @@ def compute_quantiles(scores_dict: dict) -> dict:
     """
     For each alpha and each ETF compute the conformal quantile q̂.
     Also compute a pooled q̂ across all ETFs (used as fallback).
-
-    For score_type=absolute, q̂ is in return units (e.g. 0.015 = 1.5%).
-    For score_type=normalised, q̂ is in sigma units.
     """
     scores     = np.array(scores_dict["scores"])   # (n_cal, n_assets)
     tickers    = scores_dict["tickers"]
@@ -173,7 +173,6 @@ def compute_quantiles(scores_dict: dict) -> dict:
 
     quantiles = {}
     for alpha in ALPHA_LEVELS:
-        # Finite-sample corrected level (Vovk et al. 2005)
         level = np.ceil((n_cal + 1) * (1 - alpha)) / n_cal
         level = min(level, 1.0)
 
@@ -189,11 +188,11 @@ def compute_quantiles(scores_dict: dict) -> dict:
             "pooled":     round(pooled, 6),
             "level_used": round(float(level), 6),
             "score_type": score_type,
-            # human-readable interpretation
             "interpretation": (
                 f"interval half-width = q̂ × σ  (q̂ in σ-units)"
                 if score_type == "normalised"
-                else f"interval half-width = q̂  (q̂ = {round(pooled*100,3):.3f}% return)"
+                else f"interval half-width = q̂  "
+                     f"(q̂ = {round(pooled*100,3):.3f}% return)"
             ),
         }
 
@@ -232,24 +231,26 @@ def save_conformal(option: str, scores_dict: dict,
                    quantiles: dict, coverage: dict) -> dict:
     os.makedirs(cfg.MODELS_DIR, exist_ok=True)
     out = {
-        "option":         option,
-        "calibrated_at":  datetime.utcnow().isoformat(),
-        "score_type":     scores_dict["score_type"],
-        "score_label":    scores_dict["score_label"],
-        "n_cal":          scores_dict["n_cal"],
-        "val_start":      scores_dict["val_start"],
-        "val_end":        scores_dict["val_end"],
-        "tickers":        scores_dict["tickers"],
-        "alpha_levels":   ALPHA_LEVELS,
+        "option":        option,
+        "calibrated_at": datetime.utcnow().isoformat(),
+        "score_type":    scores_dict["score_type"],
+        "score_label":   scores_dict["score_label"],
+        "n_cal":         scores_dict["n_cal"],
+        "val_start":     scores_dict["val_start"],
+        "val_end":       scores_dict["val_end"],
+        "tickers":       scores_dict["tickers"],
+        "alpha_levels":  ALPHA_LEVELS,
         "score_stats": {
             "mean": scores_dict["score_mean"],
             "p50":  scores_dict["score_p50"],
             "p90":  scores_dict["score_p90"],
         },
-        "quantiles":  quantiles,
-        "coverage":   coverage,
+        "quantiles": quantiles,   # ← the key predict_conformal.py needs
+        "coverage":  coverage,
     }
-    path = os.path.join(cfg.MODELS_DIR, f"conformal_option{option}.json")
+
+    # FIX: use conformal_params_option{X}.json — distinct from signal output
+    path = os.path.join(cfg.MODELS_DIR, f"conformal_params_option{option}.json")
     with open(path, "w") as f:
         json.dump(out, f, indent=2)
     print(f"[calibrate] Saved → {path}")
@@ -265,11 +266,12 @@ def upload_conformal(option: str):
     try:
         from huggingface_hub import HfApi
         api  = HfApi(token=cfg.HF_TOKEN)
-        path = os.path.join(cfg.MODELS_DIR, f"conformal_option{option}.json")
+        path = os.path.join(cfg.MODELS_DIR, f"conformal_params_option{option}.json")
         with open(path, "rb") as f:
             api.upload_file(
                 path_or_fileobj=f,
-                path_in_repo=f"conformal/conformal_option{option}.json",
+                # FIX: upload to new name on HF too
+                path_in_repo=f"conformal/conformal_params_option{option}.json",
                 repo_id=cfg.HF_SIGNALS_REPO,
                 repo_type="dataset",
                 commit_message=f"Update conformal calibration Option {option}",
@@ -284,7 +286,6 @@ def upload_conformal(option: str):
 def print_summary(option: str, scores_dict: dict,
                   quantiles: dict, coverage: dict):
     score_type = scores_dict["score_type"]
-    unit       = "σ-units" if score_type == "normalised" else "return units"
 
     print(f"\n{'─'*60}")
     print(f"Conformal calibration — Option {option}  [{score_type}]")
