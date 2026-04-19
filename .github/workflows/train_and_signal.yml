@@ -1,0 +1,99 @@
+name: Train NCDE + Generate Signal
+
+# FIX (b): Combines the old train.yml and daily_predict.yml into one workflow.
+# After training completes, predict.py runs immediately in the same job —
+# no need for a second workflow or a separate trigger.
+#
+# This workflow is for:
+#   • Manual reruns (workflow_dispatch)
+#   • Scheduled weekly retraining (Sunday night)
+#
+# The separate daily_signal.yml handles weekday-only signal generation
+# (without retraining) using the already-trained model artifacts.
+
+on:
+  workflow_dispatch:
+    inputs:
+      option:
+        description: "Which option to train and signal (A / B / both)"
+        required: false
+        default: "both"
+  schedule:
+    # Weekly retrain: Sunday 20:00 UTC (after markets close, before Mon open)
+    - cron: "0 20 * * 0"
+
+jobs:
+  train-and-signal:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360       # up to 6h for CPU training on free tier
+
+    steps:
+      # ── Checkout ────────────────────────────────────────────────────────────
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      # ── Python ──────────────────────────────────────────────────────────────
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Cache pip (train deps)
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-train-${{ hashFiles('requirements_train.txt') }}
+          restore-keys: ${{ runner.os }}-pip-train-
+
+      - name: Install training dependencies
+        run: pip install -r requirements_train.txt
+
+      # ── Train ────────────────────────────────────────────────────────────────
+      - name: Train NCDE models
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: |
+          python train.py --option ${{ github.event.inputs.option || 'both' }}
+
+      # ── Signal (immediately after train, same job) ───────────────────────────
+      - name: Generate signals
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: |
+          python predict.py --option ${{ github.event.inputs.option || 'both' }}
+
+      # ── Verify conformal output ──────────────────────────────────────────────
+      - name: Verify conformal signal output
+        run: |
+          python - <<'EOF'
+          import json, os, sys
+          path = "models/latest_signals_conformal.json"
+          if not os.path.exists(path):
+              print("ERROR: latest_signals_conformal.json not found")
+              sys.exit(1)
+          with open(path) as f:
+              d = json.load(f)
+          ok = False
+          for key in ["option_A", "option_B"]:
+              sig = d.get(key)
+              if sig and sig.get("top_pick"):
+                  iv = sig.get("top_interval_90", {})
+                  print(f"  {key}: {sig['top_pick']}  mu={sig['top_mu']:.4f}  "
+                        f"90% CI=[{iv.get('lo','?')}, {iv.get('hi','?')}]  "
+                        f"signal_date={sig['signal_date']}")
+                  ok = True
+              else:
+                  print(f"  {key}: no signal")
+          if not ok:
+              sys.exit(1)
+          EOF
+
+      # ── Commit model + signal artifacts back to repo ─────────────────────────
+      - name: Commit artifacts
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add models/ || true
+          git diff --cached --quiet || \
+            git commit -m "chore: retrain + signal $(date -u +'%Y-%m-%d')"
+          git push || true
