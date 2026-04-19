@@ -1,12 +1,10 @@
 name: Daily Conformal Signals
-
 # Runs after the NCDE daily predict (23:00 UTC).
 # On first run: auto-calibrates (loads model weights, computes q̂ on val set).
 # On subsequent runs: wraps today's NCDE signal with pre-computed q̂.
 #
 # IMPORTANT: installs requirements_train.txt (not just requirements.txt) so
 # auto-calibration can load the NCDE model via torchcde/torchdiffeq.
-
 on:
   schedule:
     - cron: "10 23 * * 1-5"    # 23:10 UTC Mon–Fri (10 min after predict)
@@ -20,27 +18,22 @@ on:
         description: "Set true to delete cached params and recalibrate from scratch"
         required: false
         default: "false"
-
 jobs:
   conformal-predict:
     runs-on: ubuntu-latest
     timeout-minutes: 30
-
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
           cache: "pip"
-
       - name: Install dependencies (inference + training, for auto-calibration)
         run: |
           pip install -r requirements.txt
           pip install -r requirements_train.txt
-
       - name: Download model weights from HF
         env:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
@@ -49,10 +42,8 @@ jobs:
           import os
           from huggingface_hub import hf_hub_download
           import config as cfg
-
           os.makedirs(cfg.MODELS_DIR, exist_ok=True)
           token = os.environ["HF_TOKEN"]
-
           for option in ["A", "B"]:
               for fname in [
                   f"ncde_option{option}_best.pt",
@@ -71,13 +62,14 @@ jobs:
                   except Exception as e:
                       print(f"  Skipped models/{fname}: {e}")
           EOF
-
       - name: Force recalibrate (optional)
         if: ${{ github.event.inputs.force_recalibrate == 'true' }}
         run: |
+          # FIX: delete new canonical param filename (conformal_params_option*.json)
+          # The old name was conformal_option*.json — both are removed for safety.
+          rm -f models/conformal_params_option*.json
           rm -f models/conformal_option*.json
           echo "Deleted cached conformal params — will recalibrate from scratch."
-
       - name: Run conformal predict
         env:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
@@ -85,7 +77,6 @@ jobs:
           OPTION="${{ github.event.inputs.option || 'both' }}"
           echo "Running: python -m conformal.predict_conformal --option $OPTION"
           python -m conformal.predict_conformal --option "$OPTION"
-
       - name: Summary
         run: |
           python - <<'EOF'
